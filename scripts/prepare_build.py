@@ -34,6 +34,20 @@ def prepare(root):
                                          and isinstance(node.body[0].value.value, str)))
                         node.body[index:index] = spatial
             path.write_text(ast.unparse(ast.fix_missing_locations(tree)) + "\n", encoding="utf8")
+    # All sparse-oracle methods used by the scenario adapter are overridden;
+    # emit those exact methods without its unused dense/pandas/kernel imports.
+    source=root / 'abides_markets/oracles/sparse_mean_reverting_oracle.py'
+    tree=ast.parse(source.read_text(encoding='utf8'))
+    tree.body=[node for node in tree.body if not
+               (isinstance(node,ast.ImportFrom) and node.module in
+                ('abides_core','mean_reverting_oracle')) and not
+               (isinstance(node,ast.Import) and any(alias.name=='pandas' for alias in node.names))]
+    for node in tree.body:
+        if isinstance(node,ast.ClassDef):
+            node.bases=[]
+    tree.body.insert(0,ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0))
+    tree.body.append(ast.Assign(targets=[ast.Name(id='NanosecondTime',ctx=ast.Store())],value=ast.Name(id='int',ctx=ast.Load())))
+    (root / 't3sim/oracle.py').write_text(ast.unparse(ast.fix_missing_locations(tree))+'\n',encoding='utf8')
 
 
 if __name__ == "__main__":

@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.1.0",
+  "interface_version": "2.0",
+  "competition_id": "agenthon2026-simulation-dev",
+  "team_id": "team-88a89e0a95fcc627a369b84a78a71621",
+  "track": "simulation",
+  "phase": "dev",
+  "category": "simulator",
+  "image": {
+    "registry": "ghcr.io",
+    "repository": "aadit-n/agenthon-t3",
+    "digest": "sha256:1de238980b306fe71adcfb43d4cfeb01390eeebfaf1478b85dc375b84e6769f2"
+  },
+  "image_access": "public",
+  "models": [],
+  "license": "MIT",
+  "descriptor_digest": "sha256:34eda10e788de413717e888a3465c869db47cb32c403e94ed303f237f0c55b13"
+}

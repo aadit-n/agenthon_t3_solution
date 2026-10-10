@@ -1,22 +1,25 @@
-This folder contains an optimized, offline market simulator for Agenthon 2026 Track 3. It uses the organizer's exact market logic and random streams, compiles hot modules to C, and runs independent batch markets in separate CPU processes. It includes a Docker submission image, public validation tools, repeated benchmarks, and submission-descriptor tooling.
+This folder contains the optimized Agenthon 2026 Track 3 simulator. V2 uses C++17 for market state, the event queue, matching, cancellation and trace buffers, with typed Cython dispatch and exact NumPy random streams. Python handles the CLI and configuration; Arrow writes the outputs. It runs offline and compiles everything at build time. Read [the v2 optimization report](results/v2-optimization/REPORT.md) for measured results and design details.
 
 Read [TRACK_REQUIREMENTS.md](TRACK_REQUIREMENTS.md) for exactly what the competition expects and [RESEARCH.md](RESEARCH.md) for the existing solutions reviewed and the reasons behind the design choices.
 
 ## Verified results
 
-The final image passed **71/71 public units** through the actual developer verifier. Both Parquet outputs match all **65 single scenarios and 30 batch sub-scenarios exactly**, covering **7,728,572 exchange events**. All four calibration divergences are zero on all 12 calibration units. The five randomized/edge tests also pass.
+The v2 image passed **71/71 public units** through the actual developer verifier. Both Parquet outputs match all **65 single scenarios and 30 batch sub-scenarios exactly**, covering **7,728,572 exchange events**. All four calibration divergences are zero on all 12 calibration units. Three native tests and five retained edge tests pass; native RNG testing compares 180,000 draw triplets against pinned NumPy, including cached Gaussian values and wide integer bounds.
 
-Evidence: [public validation](results/final-public/validation.json), [container timings](results/final-public/run-times.json), and [source provenance](SOURCE_PROVENANCE.json). The largest public scenario completed in approximately 45 seconds and used approximately 1.6 GiB peak process RSS, within the published 300-second and 16 GiB limits. These measurements come from this machine, with no GPU attached locally.
+Evidence: [v2 public validation](results/v2-public/validation.json), [container timings](results/v2-public/run-times.json), [image binding](results/v2-public/image.json), and [source provenance](SOURCE_PROVENANCE.json). A complete public single pass averaged **428,466 self-reported events/s**, versus **42,521** for v1 (**10.08x**). Its full-container arithmetic mean was **126,433 events/s**. These local numbers do not establish a Codabench score.
 
-Three measured repeats after one discarded warmup produced these median container rates:
+Three measured repeats after one discarded warmup, alternating v1/v2 sequentially on the same i7-10750H under four-CPU/16-GiB caps, produced these median container rates:
 
-| Public workload | Original baseline events/s | Solution events/s | Speedup |
+| Public workload | Submitted v1 events/s | Native v2 events/s | Speedup |
 |---|---:|---:|---:|
-| Mixed agents, 20-second horizon | 6,852 | 17,178 | 2.51× |
-| 30 agents, 30-second horizon | 7,906 | 25,949 | 3.28× |
-| Eight independent batch markets | 9,132 | 39,415 | 4.32× |
+| Mixed agents, 20-second horizon | 15,786 | 41,091 | 2.60x |
+| 30 agents, 30-second horizon | 24,502 | 100,005 | 4.08x |
+| Largest public market | 23,195 | 618,854 | 26.68x |
+| Eight independent batch markets | 34,560 | 78,920 | 2.28x |
 
-All repeated trace and ledger files were byte stable. [Benchmark details](results/benchmark/benchmark.json) include the exact image identities and every measured run. [Additional variants](results/variants/validation.json) also match the baseline exactly for an unseen seed with zero-latency ties, a shock combined with STP/response delays, and the fallback geographic latency model. The largest public scenario was tested for correctness and runtime limits; it was not part of this repeated speedup comparison.
+All repeated trace and ledger files were byte stable. [Benchmark details](results/v2-vs-v1/benchmark.json) include image identities and every measured run. [Six extra variants](results/v2-variants/validation.json) match ABIDES exactly for unseen seeds, zero-latency ties, shock/STP delays, geographic latency, exchange congestion, half-rounding and frequent random shocks.
+
+The tested release is `agenthon-t3:v2` and `agenthon-t3:latest`, image ID `sha256:1de238980b306fe71adcfb43d4cfeb01390eeebfaf1478b85dc375b84e6769f2`. `agenthon-t3:v1` retains the submitted image. This local ID is distinct from the registry digest required for submission.
 
 ## Build and run
 
@@ -63,56 +66,59 @@ Python 3.13 is required for the pinned official toolkit, separately from Python 
 
 The validation script creates a separate public fixture under `results/reference-public`. It normalizes Windows checkout CRLF text to the original LF bytes and verifies the resulting manifests using the organizer's Linux functions. It never changes the track checkout. Simulator containers mount scenario configs only; reference traces are supplied to the separate scoring container.
 
-Checks include exact exchange and ledger values, scenario/seed/count/hash consistency, all four developer-verifier gates, calibration facts, and batch isolation. The Linux scorer uses a bounded RAM/swap allocation to avoid exhausting a 16 GiB Windows host; simulator runs retain the competition's four-CPU/16 GiB caps, disabled network and 300-second Final ceiling.
+Checks include exact exchange and ledger values, scenario/seed/count/hash consistency, all four developer-verifier gates, calibration facts, and batch isolation. Scoring uses one fresh Linux process per unit with one GiB RAM and up to two GiB swap to avoid the local Windows paging failure. Simulator runs retain four-CPU/16-GiB caps, disabled network and the 300-second Final ceiling. Reports are bound to immutable image IDs; `run_public.py --score-only --isolated-scoring --resume-scoring` can retain already passing units from the same image.
 
 Repeated local benchmarks:
 
 ```powershell
-.\.venv-validation\Scripts\python.exe scripts\benchmark.py --runs 3
+.\.venv-validation\Scripts\python.exe scripts\benchmark.py --candidate agenthon-t3:v2 --baseline agenthon-t3:v1 --runs 3 --output-dir results\v2-vs-v1
 ```
 
-Each image has one discarded warmup, followed by alternating sequential measured runs on fixed scenarios. Elapsed time is the Docker daemon's start-to-exit window, including startup and output writing. Trace and ledger hashes must be stable across repeats. The output is `results/benchmark/benchmark.json`.
+Each image has one discarded warmup, followed by alternating sequential measured runs on fixed scenarios. Elapsed time is the Docker daemon's start-to-exit window, including startup and output writing. Trace and ledger hashes must be stable across repeats. Add `--unit t3-gb-mega-throughput` to include the largest workload; the saved four-workload comparison is `results/v2-vs-v1/benchmark.json`.
 
 For a detailed capacity test with event/message/order-command rates, measured cgroup CPU/memory, elapsed-time ranges, and 1/2/4-worker batch scaling:
 
 ```powershell
-.\.venv-validation\Scripts\python.exe scripts\performance.py --runs 3 --warmups 1
+.\.venv-validation\Scripts\python.exe scripts\performance.py --image agenthon-t3:v2 --runs 3 --warmups 1 --public-results results\v2-public --output-dir results\v2-performance
 ```
 
-The report is [results/performance/REPORT.md](results/performance/REPORT.md); every raw run is in [performance.json](results/performance/performance.json). Use `--case mixed --runs 1 --warmups 0` for a quick smoke test. The six default cases cover mixed agents, a medium scenario, the largest public scenario, and the same eight-market batch at three worker counts. Counts come from actual Parquet rows. Exact reference values, repeat byte stability and identical batch outputs across worker counts are enforced.
+The report is [results/v2-performance/REPORT.md](results/v2-performance/REPORT.md); every raw run is in [performance.json](results/v2-performance/performance.json). Use `--case mixed --runs 1 --warmups 0` for a quick smoke test. The six default cases cover mixed agents, a medium scenario, the largest public scenario, and the same eight-market batch at three worker counts. Counts come from actual Parquet rows. Exact reference values, repeat byte stability and identical batch outputs across worker counts are enforced.
 
-The detailed test produced median full-container rates of **14,313 events/s** (mixed), **23,101 events/s** (medium), **22,692 events/s** (largest), and **38,510 events/s** (eight-market batch, four workers). The batch handled **15,196 order commands/s** and **34,408 messages/s**. Four workers were **2.15 times** as fast as one on that batch. Maximum measured cgroup memory was approximately **1.51 GiB**. The report includes CPU utilization, job times and ranges across all 18 measured runs; six warmups were excluded. The local CPU was an Intel Core i7-10750H.
+The separate capacity run produced median full-container rates of **37,798 events/s** (mixed), **101,962 events/s** (medium), **626,046 events/s** (largest), and **69,530 events/s** (eight-market batch, four workers). The largest case handled **761,345 messages/s** and **120,684 order commands/s** in **1.866 seconds**. Maximum cgroup memory was **374.7 MiB**, compared with 1,548.8 MiB in the earlier v1 capacity run. The small batch's two/four-worker timing ranges overlap. The report includes CPU utilization and ranges across 18 measured runs, with six discarded warmups.
 
-The simulator is a CLI job processor. Events/s is the leaderboard metric; messages/s and order commands/s are useful diagnostic capacities, and scenario jobs/s depends on the configured simulation horizon and population. These numbers do not measure HTTP request capacity. The earlier complete public pass averaged 42,521 self-reported events/s and 26,849 full-container events/s. The verified Development leader on October 10, 2026 was fuzz at 231,024.2407, numerically 5.43 times that local self-reported mean. [Leaderboard](https://www.agenthon.net/)
+The simulator is a CLI job processor. Events/s is the leaderboard metric; messages/s and order commands/s are diagnostic capacities, and scenario jobs/s depends on horizon and population. These numbers do not measure HTTP request capacity. The v2 complete public single-pass self-reported mean is numerically 1.85 times the user-provided 231,024.2407 target. [Leaderboard](https://www.agenthon.net/)
 
-These are local, non-rankable measurements. The sealed suite, organizer instance and Final evaluation plan are unavailable here, so local success does not establish a Final score or a globally fastest implementation. The current version has not demonstrated leaderboard-leading throughput.
+These are local, non-rankable measurements. The sealed suite, organizer instance and Final evaluation plan are unavailable here. A new Codabench evaluation is needed to establish the v2 score; local success does not establish rank or a globally fastest implementation.
 
 ## Submission
 
-Registry publication and CodaBench upload have not been performed. After choosing your registry repository, tag/push the tested image and record its **registry manifest digest**. A local Docker image/config ID is not the registry digest.
+Publication/upload of v2 has not been performed. Tag/push `agenthon-t3:v2` to `ghcr.io/YOUR_GITHUB_USERNAME/agenthon-t3:v2`, make the package public, verify anonymous pullability, and record its **new registry manifest digest**. Regenerate the descriptor and ZIP; existing ZIPs identify v1. A local image ID is not the registry digest.
 
 Use the toolkit's `submission alias` command to derive your team ID, then generate the descriptor from its published fixture:
 
 ```powershell
 .\.venv-validation\Scripts\python.exe scripts\make_descriptor.py `
-  --registry docker.io --repository YOUR_ACCOUNT/agenthon-t3 `
+  --registry ghcr.io --repository YOUR_GITHUB_USERNAME/agenthon-t3 `
   --digest sha256:YOUR_REGISTRY_MANIFEST_DIGEST `
   --team-id YOUR_DERIVED_TEAM_ID --phase dev --out submission.json
 .\.venv-validation\Scripts\qfbench2.exe submission pack `
-  --descriptor submission.json --team-number YOUR_TEAM_NUMBER --out submission.zip
+  --descriptor submission.json --team-number YOUR_TEAM_NUMBER --out submission-v2.zip
 ```
 
 `pack` prompts for the Team Key without echoing it. For Final use `--phase final` and follow the organizer's phase-specific instructions. The descriptor declares `category=simulator`, `models=[]`, `image_access=public`, and MIT for the new code. Upstream BSD/MIT notices are retained in the image. Never put a Team Key into source files or the descriptor.
 
 ## Files
 
-- `t3sim/`: direct trace collection, compiled event dispatch, latency buffering, batch CLI.
+- `t3sim/native_types.hpp`, `t3sim/native.pyx`: C++ state/heap/matching and typed dispatch, native noise RNG, compact ledger and Arrow buffers.
+- `t3sim/config.py`, `t3sim/schemas.py`: lean configuration and exact nullable integer metadata.
+- `t3sim/engine.py`, `t3sim/cli.py`: output writing, earlier object engine, batch CLI.
 - `vendor/`: pinned ABIDES with the four organizer overlays and unchanged reference adapter.
 - `scripts/prepare_build.py`, `setup_native.py`: build-time transformation and compilation.
 - `scripts/run_public.py`, `scripts/validate.py`: isolated simulation and actual developer-scoring checks.
 - `scripts/benchmark.py`: same-machine repeat timing and deterministic-output checks.
 - `scripts/performance.py`: measured CPU/memory, events/messages/order rates and batch scaling.
 - `tests/test_hot.py`: RNG, copying, heap ties, FIFO depth and hidden-order edge checks.
+- `tests/test_native.py`: exact interleaved RNG streams, oracle/config seed parity, nullable nanoseconds.
 - `SOURCE_PROVENANCE.json`, `THIRD_PARTY_NOTICES.md`: source pins, hashes and licenses.
 
-The optional experimental depth cache is disabled by default because its ablation did not show a consistent gain. The submission image contains no public reference data, validation toolkit, runtime network fetches, or JIT compilation.
+The earlier object engine remains available through `T3SIM_ENGINE=object`; its experimental price-level cache stays disabled. The native engine caches depth totals directly. `T3SIM_IO_THREADS=1` and `T3SIM_PARQUET_ENCODING=legacy` reproduce output ablations. The submission image contains no reference data, validation toolkit, runtime downloads, or JIT compilation.

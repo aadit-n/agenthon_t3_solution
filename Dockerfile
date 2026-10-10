@@ -4,6 +4,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/opt \
     OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# Install the toolchain before copying source so edits reuse this large layer.
+FROM dependencies AS toolchain
+RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev \
+    && pip install --no-cache-dir Cython==3.2.4 setuptools==82.0.0
+
+FROM dependencies AS sources
 COPY vendor/abides/abides-core/abides_core /opt/abides_core
 COPY vendor/abides/abides-markets/abides_markets /opt/abides_markets
 COPY vendor/abides_fork /opt/abides_fork
@@ -17,19 +24,18 @@ ENTRYPOINT ["entrypoint"]
 CMD ["--help"]
 
 # A separate baseline target keeps the exact organizer engine available for comparisons.
-FROM dependencies AS baseline
+FROM sources AS baseline
 ENV T3SIM_BASELINE=1
 RUN python -m compileall -q /opt
 
-FROM dependencies AS compiler
-RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
-    && pip install --no-cache-dir Cython==3.2.4 setuptools==82.0.0
+FROM toolchain AS compiler
+COPY --from=sources /opt /opt
 COPY scripts/prepare_build.py setup_native.py /tmp/build-tools/
 RUN python /tmp/build-tools/prepare_build.py /opt \
-    && cd /opt && python /tmp/build-tools/setup_native.py build_ext --inplace -j 4 \
+    && cd /opt && python /tmp/build-tools/setup_native.py build_ext --inplace -j 1 \
     && find /opt -name '*.c' -delete && rm -rf /opt/build \
     && find /opt -name '*.so' -exec strip --strip-unneeded {} \; \
     && python -m compileall -q /opt
 
-FROM dependencies AS final
+FROM sources AS final
 COPY --from=compiler /opt /opt

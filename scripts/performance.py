@@ -7,6 +7,9 @@ The service is a scenario CLI. An order command or exchange event is not an HTTP
 request. Full-container and self-reported timings are kept explicitly separate.
 """
 import argparse
+import os
+os.environ.setdefault('OPENBLAS_NUM_THREADS','1')
+os.environ.setdefault('OMP_NUM_THREADS','1')
 from collections import Counter
 from datetime import datetime, timezone
 import hashlib
@@ -163,8 +166,7 @@ def summarize(runs):
     return out
 
 
-def prior_roster(root):
-    folder = root / "results/final-public"
+def prior_roster(folder):
     if not (folder / "run-times.json").exists():
         return None
     times = json.loads((folder / "run-times.json").read_text())
@@ -175,7 +177,7 @@ def prior_roster(root):
         n = ev.get("n_events", ev.get("total_events"))
         host.append(n / record["container_elapsed_sec"])
         declared.append(ev["events_per_sec"])
-    return {"units": len(times), "protocol": "Earlier single pass over the complete public roster; not repeat medians",
+    return {"units": len(times), "path": str(folder), "protocol": "Single pass over the public roster; not repeat medians",
             "arithmetic_mean_full_container_events_per_sec": statistics.mean(host),
             "arithmetic_mean_self_reported_events_per_sec": statistics.mean(declared)}
 
@@ -200,8 +202,8 @@ def write_report(report, folder):
     roster = report.get("prior_public_roster")
     if roster:
         declared = roster["arithmetic_mean_self_reported_events_per_sec"]
-        text += [f"The earlier complete {roster['units']}-unit local public pass averaged **{declared:,.0f} self-reported events/s** and **{roster['arithmetic_mean_full_container_events_per_sec']:,.0f} full-container events/s**. The leader value is numerically **{report['leader_score']/declared:.2f}×** the local self-reported mean. That is a performance target, not a prediction of rank: hardware, timing controls and evaluation roster are not certified equivalent.\n"]
-    text += ["The current implementation has not demonstrated leaderboard-leading throughput. Detailed repeats, ranges, CPU usage, memory, event/message/order counts and simulated-time speed are in `performance.json`. Three repeats provide a useful local comparison; they do not establish production tail-latency or reliability SLAs.\n"]
+        text += [f"The complete {roster['units']}-unit local public pass in `{roster.get('path','saved public results')}` averaged **{declared:,.0f} self-reported events/s** and **{roster['arithmetic_mean_full_container_events_per_sec']:,.0f} full-container events/s**. Its self-reported mean is numerically **{declared/report['leader_score']:.2f}×** the comparison target. Hardware, timing controls and evaluation roster are not certified equivalent; these figures do not predict rank.\n"]
+    text += ["An updated official score requires uploading this image and running the organizer's evaluation. Detailed repeats, ranges, CPU usage, memory, event/message/order counts and simulated-time speed are in `performance.json`. Three repeats provide a useful local comparison; they do not establish production tail-latency or reliability SLAs.\n"]
     (folder / "REPORT.md").write_text("\n".join(text) + "\n", encoding="utf8")
 
 
@@ -211,6 +213,7 @@ def main():
     parser.add_argument("--image", default="agenthon-t3:latest")
     parser.add_argument("--track-repo", type=Path, default=root.parent / "track3-simulation-public")
     parser.add_argument("--output-dir", type=Path, default=root / "results/performance")
+    parser.add_argument('--public-results',type=Path,default=root/'results/final-public')
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--case", action="append", choices=[c[0] for c in DEFAULT_CASES])
@@ -229,7 +232,7 @@ def main():
     report = {"rankable": False, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
               "image_id": image_id, "image_label": args.image, "runs": args.runs, "warmups": args.warmups,
               "leader_score": args.leader_score, "leader_url": "https://www.agenthon.net/",
-              "environment": env, "prior_public_roster": prior_roster(root), "cases": []}
+              "environment": env, "prior_public_roster": prior_roster(args.public_results), "cases": []}
     batch_binding = None
     for label, slug, workers in DEFAULT_CASES:
         if args.case and label not in args.case:

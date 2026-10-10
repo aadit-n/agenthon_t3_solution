@@ -1,0 +1,227 @@
+#pragma once
+// Native market state. No Python object, lock, or allocation per trace field.
+#include <algorithm>
+#include <cstdint>
+#include <cmath>
+#include <list>
+#include <map>
+#include <queue>
+#include <tuple>
+#include <unordered_map>
+#include <vector>
+#include <numpy/random/bitgen.h>
+
+namespace t3 {
+using i64 = long long;
+enum Kind { WAKE, CLOSE_REQ, HOURS_REQ, HOURS, QUERY, SPREAD, LIMIT, CANCEL,
+            ACCEPTED, EXECUTED, CANCELLED, CLOSED, CLOSE_PRICE };
+enum Event { SUBMITTED, ACCEPT, EXEC, CANCEL_EVENT, QUOTE, FILL, PARTIAL };
+// Use NumPy's own MT19937 callback/state, with the legacy polar Gaussian and
+// masked integer selection. In particular, Generator's newer distributions
+// would consume different words and change the market path.
+class NoiseRandom {
+    bitgen_t* generator=nullptr;
+    bool cached=false;
+    double spare=0;
+public:
+    void bind(void* capsule, bool has_spare, double value) {
+        generator=static_cast<bitgen_t*>(capsule); cached=has_spare; spare=value;
+    }
+    double normal(double mean, double scale) {
+        double gaussian;
+        if (cached) { gaussian=spare; cached=false; spare=0; }
+        else {
+            double u,v,radius;
+            do {
+                u=2*generator->next_double(generator->state)-1;
+                v=2*generator->next_double(generator->state)-1;
+                radius=u*u+v*v;
+            } while (radius==0 || radius>=1);
+            double factor=std::sqrt((-2*std::log(radius))/radius);
+            spare=u*factor; cached=true; gaussian=v*factor;
+        }
+        return mean+scale*gaussian;
+    }
+    i64 randint(i64 upper) {
+        uint64_t maximum=static_cast<uint64_t>(upper-1);
+        if (maximum==0) return 0;
+        uint64_t mask=maximum;
+        mask|=mask>>1; mask|=mask>>2; mask|=mask>>4;
+        mask|=mask>>8; mask|=mask>>16; mask|=mask>>32;
+        uint64_t sample;
+        do {
+            sample=(maximum<=UINT32_MAX?generator->next_uint32(generator->state):
+                    generator->next_uint64(generator->state))&mask;
+        } while (sample>maximum);
+        return static_cast<i64>(sample);
+    }
+};
+struct Order {
+    i64 id=-1, price=0, quantity=0, fill_price=0;
+    int agent=0, side=0;
+};
+struct Msg {
+    i64 id=0, send=-1, recv=0, latency=0, parent=-1, bid=0, ask=0;
+    int src=0, dst=0, kind=0;
+    bool closed=false;
+    Order order;
+};
+struct Scheduled {
+    i64 time;
+    Msg msg;
+    bool operator<(const Scheduled& other) const {
+        return std::tie(time,msg.src,msg.dst,msg.id) >
+               std::tie(other.time,other.msg.src,other.msg.dst,other.msg.id);
+    }
+};
+struct TraceRow {
+    i64 time, price, size, order_id, rank;
+    int agent, kind, side;
+};
+struct LedgerRow {
+    i64 id, send, recv, latency, parent, order_id;
+    int src, dst, kind;
+};
+struct AgentState {
+    i64 time=0, delay=50, interval=0, reference=0, size=0, threshold=0, offset=0;
+    int type=0, depth=0, spread=0, lookback=0;
+    double mean=0, stddev=0, sigma_n=0;
+    bool first=true, hours=false, closed=false, awaiting=false, log_orders=true;
+    std::map<i64,Order> open;
+    std::vector<double> mids;
+};
+struct Level { std::list<i64> fifo; i64 quantity=0; };
+struct Resting { Order order; std::list<i64>::iterator position; };
+class Book {
+    std::map<i64,Level> bids, asks;
+    std::unordered_map<i64,Resting> resting;
+public:
+    i64 best_price(int side) const {
+        const auto& levels=side==0?bids:asks;
+        if (levels.empty()) return 0;
+        return side==0?levels.rbegin()->first:levels.begin()->first;
+    }
+    i64 best_size(int side) const {
+        const auto& levels=side==0?bids:asks;
+        if (levels.empty()) return 0;
+        return side==0?levels.rbegin()->second.quantity:levels.begin()->second.quantity;
+    }
+    bool cross(const Order& o) const {
+        const auto& levels=o.side==0?asks:bids;
+        if (levels.empty()) return false;
+        return o.side==0?o.price>=levels.begin()->first:o.price<=levels.rbegin()->first;
+    }
+    Order front(int incoming_side) const {
+        const auto& levels=incoming_side==0?asks:bids;
+        auto it=incoming_side==0?levels.begin():std::prev(levels.end());
+        return resting.at(it->second.fifo.front()).order;
+    }
+    void enter(const Order& o) {
+        auto& level=(o.side==0?bids:asks)[o.price];
+        level.fifo.push_back(o.id);
+        level.quantity+=o.quantity;
+        resting.emplace(o.id,Resting{o,std::prev(level.fifo.end())});
+    }
+    Order take(int incoming_side, i64 quantity) {
+        auto& levels=incoming_side==0?asks:bids;
+        auto level=incoming_side==0?levels.begin():std::prev(levels.end());
+        auto item=resting.find(level->second.fifo.front());
+        Order result=item->second.order;
+        result.quantity=std::min(quantity,result.quantity);
+        result.fill_price=result.price;
+        item->second.order.quantity-=result.quantity;
+        level->second.quantity-=result.quantity;
+        if (!item->second.order.quantity) {
+            level->second.fifo.pop_front();
+            resting.erase(item);
+            if (level->second.fifo.empty()) levels.erase(level);
+        }
+        return result;
+    }
+    Order cancel(const Order& request) {
+        auto item=resting.find(request.id);
+        if (item==resting.end() || item->second.order.side!=request.side ||
+            item->second.order.price!=request.price) return Order{};
+        Order result=item->second.order;
+        auto& levels=result.side==0?bids:asks;
+        auto level=levels.find(result.price);
+        level->second.quantity-=result.quantity;
+        level->second.fifo.erase(item->second.position);
+        resting.erase(item);
+        if (level->second.fifo.empty()) levels.erase(level);
+        return result;
+    }
+};
+class Core {
+public:
+    std::priority_queue<Scheduled> queue;
+    std::vector<AgentState> agents;
+    std::vector<int> subscriptions;
+    std::vector<TraceRow> trace;
+    std::vector<LedgerRow> ledger;
+    Book book;
+    i64 now=0, stop=0, open=0, close=0, next_msg=1, next_order=0, causal=-1;
+    i64 ack_delay=0, compute_delay=0;
+    int stp=0;
+    i64 quote_time[2]={-1,-1};
+    size_t quote_index[2]={0,0};
+    Core(int count) : agents(count) { trace.reserve(65536); ledger.reserve(65536); }
+    Msg make(int kind) { Msg m; m.id=next_msg++; m.kind=kind; return m; }
+    void wake(int agent, i64 time) {
+        Msg m=make(WAKE); m.src=agent; m.dst=agent; m.recv=time;
+        queue.push(Scheduled{time,m});
+    }
+    void enqueue(const Msg& m) { queue.push(Scheduled{m.recv,m}); }
+    void delivered(const Msg& m) {
+        ledger.push_back(LedgerRow{m.id,m.send,m.recv,m.latency,m.parent,m.order.id,m.src,m.dst,m.kind});
+    }
+    bool empty() const { return queue.empty(); }
+    Msg pop() {
+        Scheduled s=queue.top(); queue.pop(); now=s.time;
+        return s.msg;
+    }
+    void postpone(const Msg& m, i64 time) { queue.push(Scheduled{time,m}); }
+    void log(int agent, int kind, const Order& o) {
+        if (agents[agent].log_orders)
+            trace.push_back(TraceRow{now,kind==EXEC?o.fill_price:o.price,o.quantity,
+                                     o.id,(i64)trace.size(),o.agent,kind,o.side});
+    }
+    void quotes() {
+        for (int side=0; side<2; ++side) {
+            if (!book.best_size(side)) continue;
+            TraceRow row{now,book.best_price(side),book.best_size(side),-1,0,0,QUOTE,side};
+            if (quote_time[side]==now) {
+                row.rank=trace[quote_index[side]].rank;
+                trace[quote_index[side]]=row;
+            } else {
+                row.rank=(i64)trace.size(); quote_time[side]=now;
+                quote_index[side]=trace.size(); trace.push_back(row);
+            }
+        }
+    }
+    std::vector<Order> open_orders(int agent) const {
+        std::vector<Order> result; result.reserve(agents[agent].open.size());
+        for (const auto& item:agents[agent].open) result.push_back(item.second);
+        return result;
+    }
+    void executed(int agent, const Order& o) {
+        auto& orders=agents[agent].open;
+        auto it=orders.find(o.id);
+        if (it!=orders.end()) {
+            if (o.quantity>=it->second.quantity) orders.erase(it);
+            else it->second.quantity-=o.quantity;
+        }
+    }
+    void cancelled(int agent, i64 id) { agents[agent].open.erase(id); }
+    void remember(int agent, const Order& o) { agents[agent].open.emplace(o.id,o); }
+    void finish() {
+        std::sort(trace.begin(),trace.end(),[](const TraceRow& a,const TraceRow& b) {
+            return std::tie(a.time,a.order_id,a.agent,a.rank)<std::tie(b.time,b.order_id,b.agent,b.rank);
+        });
+        std::unordered_map<i64,size_t> final;
+        for (size_t i=0;i<trace.size();++i) if (trace[i].kind==EXEC) final[trace[i].order_id]=i;
+        for (size_t i=0;i<trace.size();++i) if (trace[i].kind==EXEC)
+            trace[i].kind=final.at(trace[i].order_id)==i?FILL:PARTIAL;
+    }
+};
+}

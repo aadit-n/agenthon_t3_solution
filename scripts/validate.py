@@ -4,6 +4,9 @@ References are read by this host-side validator only. They are never mounted in
 the participant container or included in its build context.
 """
 import argparse
+import os
+os.environ.setdefault('OPENBLAS_NUM_THREADS','1')
+os.environ.setdefault('OMP_NUM_THREADS','1')
 from datetime import datetime
 import gc
 import hashlib

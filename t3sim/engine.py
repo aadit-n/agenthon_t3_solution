@@ -8,39 +8,10 @@ import resource
 import time
 
 import numpy as np
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from abides_core.agent import Agent
-from abides_core.kernel import Kernel
-from abides_core.message import Message
-from abides_markets.agents.exchange_agent import ExchangeAgent
-from abides_markets.orders import LimitOrder, MarketOrder, Order
-from abides_fork.config import ScenarioLatencyModel, build_config
-from t3sim.hot import (BufferedLatency, HeapQueue, clone_order, log_event,
-                       copy_market_value, fast_runner, no_op, order_for_log)
-
-TRACE_SCHEMA = pa.schema([
-    ("t_ns", pa.int64()), ("agent_id", pa.int32()), ("msg_type", pa.string()),
-    ("side", pa.string()), ("price", pa.int64()), ("size", pa.int64()),
-    ("order_id", pa.int64()),
-])
-MESSAGE_SCHEMA = pa.schema([
-    ("seq", pa.int64()), ("t_recv_ns", pa.int64()), ("t_send_ns", pa.int64()),
-    ("latency_ns", pa.int64()), ("src_id", pa.int32()), ("dst_id", pa.int32()),
-    ("message_id", pa.int64()), ("msg_type", pa.string()), ("order_id", pa.int64()),
-    ("causal_parent", pa.int64()),
-])
-# Nullable nanosecond integers must decode to pandas Int64, never float64.
-# Float64 silently rounds ~1.6e18 timestamps and breaks message causality.
-from abides_fork.trace import _MSG_DTYPES, _TRACE_DTYPES
-TRACE_SCHEMA = TRACE_SCHEMA.with_metadata(pa.Table.from_pandas(
-    pd.DataFrame({k: pd.Series(dtype=v) for k, v in _TRACE_DTYPES.items()}),
-    preserve_index=False).schema.metadata)
-MESSAGE_SCHEMA = MESSAGE_SCHEMA.with_metadata(pa.Table.from_pandas(
-    pd.DataFrame({k: pd.Series(dtype=v) for k, v in _MSG_DTYPES.items()}),
-    preserve_index=False).schema.metadata)
+from t3sim.schemas import TRACE_SCHEMA, MESSAGE_SCHEMA
 _installed = False
 
 
@@ -48,6 +19,12 @@ def install_optimizations():
     global _installed
     if _installed:
         return
+    from abides_core.agent import Agent
+    from abides_core.kernel import Kernel
+    from abides_markets.agents.exchange_agent import ExchangeAgent
+    from abides_markets.orders import LimitOrder, MarketOrder, Order
+    from t3sim.hot import (clone_order, log_event, copy_market_value,
+                          fast_runner, no_op, order_for_log)
     Agent.logEvent = log_event
     Kernel.runner = fast_runner
     # The upstream summary writer creates a second-resolution directory even
@@ -119,21 +96,41 @@ def simulate(config_path, out_path, seed=None):
     scenario = json.loads(pathlib.Path(config_path).read_text(encoding="utf8"))
     if seed is not None:
         scenario["seed"] = int(seed)
+    # abides.run actually seeds the kernel with zero, ignoring config's kernel
+    # RandomState. Reproduce that behavior exactly rather than "fixing" it.
+    if os.environ.get("T3SIM_ENGINE", "native") == "native":
+        from t3sim.config import build_native_config
+        from t3sim.native import run_native
+        config = build_native_config(scenario)
+        pa.set_cpu_count(1)
+        pa.set_io_thread_count(1)
+        sim_started = time.perf_counter()
+        trace, messages = run_native(config)
+        sim_seconds = time.perf_counter() - sim_started
+    else:
+        trace, messages, sim_seconds = run_object_engine(scenario)
+    return write_outputs(scenario, out_path, trace, messages, started, sim_seconds)
+
+
+def run_object_engine(scenario):
+    from abides_core.kernel import Kernel
+    from abides_core.message import Message
+    from abides_markets.orders import Order
+    from abides_fork.config import ScenarioLatencyModel, build_config
+    from t3sim.hot import BufferedLatency, HeapQueue
     install_optimizations()
     Order._order_id_counter = 0
     setattr(Message, "_Message__message_id_counter", 1)
     config = build_config(scenario)
-    agents = config["agents"]
+    agents = config['agents']
     for agent in agents:
         agent._trace_orders = []
         agent._trace_quotes = {}
         agent.log_to_file = False
     agents[0].book_logging = False
-    latency = config["agent_latency_model"]
+    latency = config['agent_latency_model']
     if isinstance(latency, ScenarioLatencyModel):
         latency = BufferedLatency(latency)
-    # abides.run actually seeds the kernel with zero, ignoring config's kernel
-    # RandomState. Reproduce that behavior exactly rather than "fixing" it.
     kernel = Kernel(agents=agents, start_time=config["start_time"],
                     stop_time=config["stop_time"],
                     agent_latency_model=latency,
@@ -146,14 +143,27 @@ def simulate(config_path, out_path, seed=None):
     sim_seconds = time.perf_counter() - sim_started
     trace = extract_fast_trace(agents)
     messages = extract_fast_messages(end_state)
+    return trace, messages, sim_seconds
+
+
+def write_outputs(scenario, out_path, trace, messages, started, sim_seconds):
     out_path = pathlib.Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     msg_out = out_path.parent / "message_trace.parquet"
     # Fixed row-group size/encoding is independent of elapsed time, process ID,
     # batch position and scheduling, ensuring byte-stable repeat outputs.
-    pq.write_table(trace, out_path, compression="snappy", row_group_size=262144)
-    pq.write_table(messages, msg_out, compression="snappy", row_group_size=262144)
-    trace_hash, msg_hash = sha256(out_path), sha256(msg_out)
+    if os.environ.get('T3SIM_IO_THREADS','2')=='1':
+        trace_hash=write_parquet(trace,out_path)
+        msg_hash=write_parquet(messages,msg_out)
+    else:
+        # Arrow's writers release the GIL. The two immutable tables and their
+        # files are independent; encoding and row-group boundaries stay fixed.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            trace_future=pool.submit(write_parquet,trace,out_path)
+            msg_future=pool.submit(write_parquet,messages,msg_out)
+            trace_hash=trace_future.result()
+            msg_hash=msg_future.result()
     elapsed = time.perf_counter() - started
     events = {
         "scenario_id": str(scenario["scenario_id"]), "seed": int(scenario["seed"]),
@@ -165,3 +175,15 @@ def simulate(config_path, out_path, seed=None):
     }
     (out_path.parent / "events.json").write_text(json.dumps(events, indent=2) + "\n")
     return events
+
+
+def write_parquet(table,path):
+    encoding=os.environ.get('T3SIM_PARQUET_ENCODING','delta')
+    options={}
+    if encoding!='legacy':
+        options['use_dictionary']=[field.name for field in table.schema if pa.types.is_string(field.type)]
+        if encoding=='delta':
+            options['column_encoding']={field.name:'DELTA_BINARY_PACKED' for field in table.schema
+                                        if pa.types.is_integer(field.type)}
+    pq.write_table(table,path,compression='snappy',row_group_size=262144,**options)
+    return sha256(path)

@@ -1,5 +1,9 @@
 """Compare unseen seeds/parameters, tie latency and fallback latency with ABIDES."""
 import copy
+import os
+os.environ.setdefault('OPENBLAS_NUM_THREADS','1')
+os.environ.setdefault('OMP_NUM_THREADS','1')
+import argparse
 import json
 from pathlib import Path
 
@@ -10,6 +14,11 @@ from validate import launch
 
 def main():
     root = Path(__file__).resolve().parents[1]
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--candidate',default='agenthon-t3:latest')
+    parser.add_argument('--baseline',default='agenthon-t3-baseline:local')
+    parser.add_argument('--output-dir',type=Path,default=root/'results/variants')
+    args=parser.parse_args()
     original = json.loads((root.parent / "track3-simulation-public/units/t3-as01-base-mix/scenario.json").read_text())
     variants = []
     tie = copy.deepcopy(original)
@@ -27,13 +36,29 @@ def main():
     fallback.update(seed=54321, scenario_id="custom-geographic-latency", horizon_ns=1_000_000_000)
     fallback.pop("latency_config")
     variants.append(fallback)
+    congested=copy.deepcopy(tie)
+    congested.update(seed=123,scenario_id='custom-busy-exchange',horizon_ns=100_000_000)
+    congested['exchange_config'].update(protocol_enforcement=True,stp_policy='cancel_newest',
+                                         ack_delay_ns=10_000_000,compute_delay_ns=500_000)
+    variants.append(congested)
+    thin=copy.deepcopy(tie)
+    thin.update(seed=888,scenario_id='custom-low-price-and-half-rounding')
+    thin['oracle_config']['params']['initial_price']=2
+    thin['agent_configs']=[{'agent_type':'NoiseTrader','count':4,
+                           'params':{'arrival_rate_hz':100,'order_size_mean':10.5,
+                                     'order_size_std':0,'price_offset_ticks':0}}]
+    variants.append(thin)
+    jumps=copy.deepcopy(shock)
+    jumps.update(seed=31337,scenario_id='custom-frequent-random-jumps')
+    jumps['oracle_config']['params'].update(jump_intensity=25.0,jump_sigma=7.0,sigma=.0005)
+    variants.append(jumps)
     report = []
     for scenario in variants:
-        out = root / "results/variants" / scenario["scenario_id"]
+        out = args.output_dir / scenario["scenario_id"]
         out.mkdir(parents=True, exist_ok=True)
         config = out / "scenario.json"
         config.write_text(json.dumps(scenario))
-        for label, image in (("baseline", "agenthon-t3-baseline:local"), ("candidate", "agenthon-t3:latest")):
+        for label, image in (("baseline", args.baseline), ("candidate", args.candidate)):
             launch(image, config, out / label, "simulate",
                    ["--config", "/input/scenario.json", "--out", "/output/trace.parquet"])
         equality = {file: pq.read_table(out / "baseline" / file).equals(
@@ -42,7 +67,7 @@ def main():
         report.append({"scenario": scenario["scenario_id"], "equal": equality,
                        "passed": all(equality.values())})
         print(report[-1], flush=True)
-    (root / "results/variants/validation.json").write_text(json.dumps(report, indent=2) + "\n")
+    (args.output_dir / 'validation.json').write_text(json.dumps(report, indent=2) + "\n")
     return not all(r["passed"] for r in report)
 
 
