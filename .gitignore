@@ -1,0 +1,12 @@
+.runtime/
+.venv/
+python311.zip
+build/
+results/
+__pycache__/
+*.pyc
+*.pyd
+*.so
+*.c
+submission.json
+submission.zip

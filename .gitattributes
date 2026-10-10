@@ -1,0 +1,3 @@
+scripts/*.sh text eol=lf
+Dockerfile text eol=lf
+validation-wheels/Dockerfile text eol=lf
