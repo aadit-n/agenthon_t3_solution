@@ -6,6 +6,7 @@
 #include <functional>
 #include <limits>
 #include <type_traits>
+#include <future>
 #ifdef T3_FAST_SNAPPY
 namespace snappy_fast {void RawCompress(const char*,size_t,char*,size_t*);}
 #endif
@@ -243,6 +244,12 @@ Bytes footer(const std::vector<Field>& fields,const std::vector<Group>& groups,i
     file.list(5,12,1);{Compact kv{bytes};kv.binary(1,"pandas");kv.binary(2,pandas(fields));kv.end();}
     file.binary(6,"agenthon-t3 native flat writer 4.0");file.end();return bytes;
 }
+struct ColumnPayload {
+    Chunk chunk;
+    Bytes bytes;
+    int64_t rel_data_offset=0;
+    int64_t rel_dict_offset=-1;
+};
 class Writer {
     Compress compress=compressor();
     Output output;std::vector<Field> fields;std::vector<Group> groups;Buffer<char> compressed;
@@ -251,28 +258,32 @@ class Writer {
     std::vector<uint8_t> type_codes;
     std::vector<size_t> last_execution;
     bool plain_numeric=env("T3SIM_LITE_ENCODING","delta")=="plain";
-    void page(Chunk& chunk,const Bytes& raw,int count,bool dictionary) {
-        compressed.resize(snappy::MaxCompressedLength(raw.size()));size_t size=compressed.size();
-        compress(reinterpret_cast<const char*>(raw.data()),raw.size(),compressed.data(),&size);compressed.resize(size);
+    bool parallel=false;
+
+    void page_into(ColumnPayload& cp,const Bytes& raw,int count,bool dictionary,Buffer<char>& scratch) {
+        scratch.resize(snappy::MaxCompressedLength(raw.size()));size_t size=scratch.size();
+        compress(reinterpret_cast<const char*>(raw.data()),raw.size(),scratch.data(),&size);scratch.resize(size);
         if(raw.size()>INT32_MAX||size>INT32_MAX) throw std::runtime_error("Parquet page too large");
         Bytes header;Compact p{header};p.integer(1,dictionary?2:0);p.integer(2,raw.size());p.integer(3,size);
         if(dictionary) {
-            p.object(7,[&](Compact& h){h.integer(1,count);h.integer(2,0);});chunk.dict_offset=output.position;
+            p.object(7,[&](Compact& h){h.integer(1,count);h.integer(2,0);});cp.rel_dict_offset=cp.bytes.size();
         } else {
-            p.object(5,[&](Compact& h){h.integer(1,count);h.integer(2,chunk.encoding);h.integer(3,3);h.integer(4,3);});chunk.data_offset=output.position;
+            p.object(5,[&](Compact& h){h.integer(1,count);h.integer(2,cp.chunk.encoding);h.integer(3,3);h.integer(4,3);});cp.rel_data_offset=cp.bytes.size();
         }
-        p.end();chunk.uncompressed+=header.size()+raw.size();chunk.compressed+=header.size()+size;
-        header.insert(header.end(),reinterpret_cast<const uint8_t*>(compressed.data()),reinterpret_cast<const uint8_t*>(compressed.data())+size);
-        output.write(header.data(),header.size());
+        p.end();cp.chunk.uncompressed+=header.size()+raw.size();cp.chunk.compressed+=header.size()+size;
+        cp.bytes.insert(cp.bytes.end(),header.begin(),header.end());
+        cp.bytes.insert(cp.bytes.end(),reinterpret_cast<const uint8_t*>(scratch.data()),reinterpret_cast<const uint8_t*>(scratch.data())+size);
     }
-    template<class T,class F> void numeric(Chunk& chunk,const Field& field,int64_t first,int64_t n,F get) {
+
+    template<class T,class F> ColumnPayload encode_numeric(const Field& field,int64_t first,int64_t n,F get,Buffer<char>& scratch) {
+        ColumnPayload cp{Chunk{field.physical,5,n},{}};
 #ifdef T3_IMPLICIT_SEQUENCE
         if(field.name=="seq"&&!plain_numeric) {
             Bytes levels;varint(levels,uint64_t(n)*2);levels.push_back(1);
             Bytes raw;raw.reserve(size_t(n/128*5+32));little32(raw,levels.size());raw.insert(raw.end(),levels.begin(),levels.end());
             varint(raw,128);varint(raw,4);varint(raw,n);varint(raw,zigzag(get(first)));
             for(int64_t i=1;i<n;i+=128) {varint(raw,2);raw.insert(raw.end(),4,0);}
-            chunk.encoding=5;page(chunk,raw,int(n),false);return;
+            cp.chunk.encoding=5;page_into(cp,raw,int(n),false,scratch);return cp;
         }
 #endif
 #ifdef T3_INDEXED_VALUES
@@ -305,57 +316,93 @@ class Writer {
             auto limits=std::minmax_element(values.begin(),values.end());T minimum=*limits.first,maximum=*limits.second;uint64_t range=uint64_t(maximum)-uint64_t(minimum);
             if(range<4096&&range+1<uint64_t(n)) {
                 Bytes dict;dict.resize(size_t(range+1)*sizeof(T));for(uint64_t i=0;i<=range;++i) {T value=minimum+T(i);std::memcpy(dict.data()+i*sizeof(T),&value,sizeof(T));}
-                page(chunk,dict,int(range+1),true);chunk.encoding=8;
+                page_into(cp,dict,int(range+1),true,scratch);cp.chunk.encoding=8;
                 auto indices=dictionary_indices(n,std::max(1,bit_width(range)),[&](int64_t i){return uint64_t(values[i])-uint64_t(minimum);});
                 raw.insert(raw.end(),indices.begin(),indices.end());dictionary=true;
             }
         }
         if(!dictionary&&plain_numeric) {
-            chunk.encoding=0;size_t first=raw.size();raw.resize(first+values.size()*sizeof(T));
-            if(!values.empty()) std::memcpy(raw.data()+first,values.data(),values.size()*sizeof(T));
+            cp.chunk.encoding=0;size_t first_idx=raw.size();raw.resize(first_idx+values.size()*sizeof(T));
+            if(!values.empty()) std::memcpy(raw.data()+first_idx,values.data(),values.size()*sizeof(T));
         } else if(!dictionary) {
 #ifdef T3_FUSED_DELTA
-            chunk.encoding=5;delta_into(raw,values);
+            cp.chunk.encoding=5;delta_into(raw,values);
 #else
-            auto encoded=delta(values);chunk.encoding=5;raw.insert(raw.end(),encoded.begin(),encoded.end());
+            auto encoded=delta(values);cp.chunk.encoding=5;raw.insert(raw.end(),encoded.begin(),encoded.end());
 #endif
         }
-        page(chunk,raw,int(n),false);
+        page_into(cp,raw,int(n),false,scratch);return cp;
     }
-    template<class F> void strings(Chunk& chunk,const Field& field,int64_t first,int64_t n,F get) {
+
+    template<class F> ColumnPayload encode_strings(const Field& field,int64_t first,int64_t n,F get,Buffer<char>& scratch) {
+        ColumnPayload cp{Chunk{field.physical,8,n},{}};
         Bytes dict;for(const auto& value:field.labels) {little32(dict,value.size());dict.insert(dict.end(),value.begin(),value.end());}
-        page(chunk,dict,field.labels.size(),true);chunk.encoding=8;
+        page_into(cp,dict,field.labels.size(),true,scratch);cp.chunk.encoding=8;
         Bytes levels;varint(levels,uint64_t(n)*2);levels.push_back(1);Bytes raw;little32(raw,levels.size());raw.insert(raw.end(),levels.begin(),levels.end());
         auto indices=dictionary_indices(n,std::max(1,bit_width(field.labels.size()-1)),[&](int64_t i){return get(first+i);});
-        raw.insert(raw.end(),indices.begin(),indices.end());page(chunk,raw,int(n),false);
+        raw.insert(raw.end(),indices.begin(),indices.end());page_into(cp,raw,int(n),false,scratch);return cp;
     }
+
+    void write_payload(Group& group,ColumnPayload&& cp) {
+        int64_t base_pos=output.position;
+        if(cp.rel_dict_offset>=0) cp.chunk.dict_offset=base_pos+cp.rel_dict_offset;
+        else cp.chunk.dict_offset=-1;
+        cp.chunk.data_offset=base_pos+cp.rel_data_offset;
+        output.write(cp.bytes.data(),cp.bytes.size());
+        group.bytes+=cp.chunk.uncompressed;group.compressed+=cp.chunk.compressed;
+        group.columns.push_back(cp.chunk);
+    }
+
 public:
-    Writer(const fs::path& path,std::vector<Field> schema):output(path),fields(std::move(schema)) {output.write("PAR1",4);}
+    Writer(const fs::path& path,std::vector<Field> schema,bool parallel_mode=false):output(path),fields(std::move(schema)),parallel(parallel_mode) {output.write("PAR1",4);}
+
     template<class F> void append(int64_t n,F get) {
         if(n<=0) return;Group group{n};group.columns.reserve(fields.size());
+        Buffer<char> scratch;
         for(size_t col=0;col<fields.size();++col) {
-            const auto& field=fields[col];Chunk chunk{field.physical,5,n};auto value=[&](int64_t i){return get(col,i);};
-            if(field.physical==6) strings(chunk,field,0,n,value);
-            else if(field.physical==1) numeric<int32_t>(chunk,field,0,n,value);
-            else numeric<int64_t>(chunk,field,0,n,value);
-            group.bytes+=chunk.uncompressed;group.compressed+=chunk.compressed;group.columns.push_back(chunk);
+            const auto& field=fields[col];auto value=[&](int64_t i){return get(col,i);};
+            ColumnPayload cp;
+            if(field.physical==6) cp=encode_strings(field,0,n,value,scratch);
+            else if(field.physical==1) cp=encode_numeric<int32_t>(field,0,n,value,scratch);
+            else cp=encode_numeric<int64_t>(field,0,n,value,scratch);
+            write_payload(group,std::move(cp));
         }
         groups.push_back(std::move(group));rows+=n;
     }
+
     void append_ledger(const LedgerRow* input,int64_t n,int64_t first) {
         if(n<=0) return;Group group{n};group.columns.reserve(10);
-        {Chunk c{fields[0].physical,5,n};numeric<int64_t>(c,fields[0],0,n,[&](int64_t i){return first+i;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
-        {Chunk c{fields[1].physical,5,n};numeric<int64_t>(c,fields[1],0,n,[&](int64_t i){return input[i].recv;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
-        {Chunk c{fields[2].physical,5,n};numeric<int64_t>(c,fields[2],0,n,[&](int64_t i){return input[i].send;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
-        {Chunk c{fields[3].physical,5,n};numeric<int64_t>(c,fields[3],0,n,[&](int64_t i){return input[i].latency;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
-        {Chunk c{fields[4].physical,5,n};numeric<int32_t>(c,fields[4],0,n,[&](int64_t i){return input[i].src;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
-        {Chunk c{fields[5].physical,5,n};numeric<int32_t>(c,fields[5],0,n,[&](int64_t i){return input[i].dst;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
-        {Chunk c{fields[6].physical,5,n};numeric<int64_t>(c,fields[6],0,n,[&](int64_t i){return input[i].id;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
-        {Chunk c{fields[7].physical,5,n};strings(c,fields[7],0,n,[&](int64_t i){return input[i].kind;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
-        {Chunk c{fields[8].physical,5,n};numeric<int64_t>(c,fields[8],0,n,[&](int64_t i){return input[i].order_id;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
-        {Chunk c{fields[9].physical,5,n};numeric<int64_t>(c,fields[9],0,n,[&](int64_t i){return input[i].parent;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
+        std::vector<ColumnPayload> cols(10);
+        auto encode_cols=[&](int start_c,int end_c) {
+            Buffer<char> scratch;
+            for(int c=start_c;c<end_c;++c) {
+                switch(c) {
+                    case 0: cols[0]=encode_numeric<int64_t>(fields[0],0,n,[&](int64_t i){return first+i;},scratch);break;
+                    case 1: cols[1]=encode_numeric<int64_t>(fields[1],0,n,[&](int64_t i){return input[i].recv;},scratch);break;
+                    case 2: cols[2]=encode_numeric<int64_t>(fields[2],0,n,[&](int64_t i){return input[i].send;},scratch);break;
+                    case 3: cols[3]=encode_numeric<int64_t>(fields[3],0,n,[&](int64_t i){return input[i].latency;},scratch);break;
+                    case 4: cols[4]=encode_numeric<int32_t>(fields[4],0,n,[&](int64_t i){return input[i].src;},scratch);break;
+                    case 5: cols[5]=encode_numeric<int32_t>(fields[5],0,n,[&](int64_t i){return input[i].dst;},scratch);break;
+                    case 6: cols[6]=encode_numeric<int64_t>(fields[6],0,n,[&](int64_t i){return input[i].id;},scratch);break;
+                    case 7: cols[7]=encode_strings(fields[7],0,n,[&](int64_t i){return input[i].kind;},scratch);break;
+                    case 8: cols[8]=encode_numeric<int64_t>(fields[8],0,n,[&](int64_t i){return input[i].order_id;},scratch);break;
+                    case 9: cols[9]=encode_numeric<int64_t>(fields[9],0,n,[&](int64_t i){return input[i].parent;},scratch);break;
+                }
+            }
+        };
+        if(parallel&&n>=2048) {
+            auto f1=std::async(std::launch::async,[&](){encode_cols(3,6);});
+            auto f2=std::async(std::launch::async,[&](){encode_cols(6,8);});
+            auto f3=std::async(std::launch::async,[&](){encode_cols(8,10);});
+            encode_cols(0,3);
+            f1.get();f2.get();f3.get();
+        } else {
+            encode_cols(0,10);
+        }
+        for(int c=0;c<10;++c) write_payload(group,std::move(cols[c]));
         groups.push_back(std::move(group));rows+=n;
     }
+
     void append_trace(const std::vector<TraceRow>& trace,int64_t first,int64_t n) {
         if(n<=0) return;deferred_types=true;Group group{n};group.columns.reserve(7);
         for(int64_t i=0;i<n;++i) {
@@ -368,21 +415,48 @@ public:
             }
             type_codes.push_back(uint8_t(kind));
         }
-        {Chunk c{fields[0].physical,8,n};numeric<int64_t>(c,fields[0],0,n,[&](int64_t i){return trace[first+i].time;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
-        {Chunk c{fields[1].physical,8,n};numeric<int32_t>(c,fields[1],0,n,[&](int64_t i){return trace[first+i].agent;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
-        {Chunk c{fields[2].physical,8,n};group.columns.push_back(c);}
-        {Chunk c{fields[3].physical,8,n};strings(c,fields[3],0,n,[&](int64_t i){return trace[first+i].side;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
-        {Chunk c{fields[4].physical,8,n};numeric<int64_t>(c,fields[4],0,n,[&](int64_t i){return trace[first+i].price;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
-        {Chunk c{fields[5].physical,8,n};numeric<int64_t>(c,fields[5],0,n,[&](int64_t i){return trace[first+i].size;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
-        {Chunk c{fields[6].physical,8,n};numeric<int64_t>(c,fields[6],0,n,[&](int64_t i){return trace[first+i].order_id;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
+        std::vector<ColumnPayload> cols(7);
+        cols[2].chunk=Chunk{fields[2].physical,8,n};
+        auto encode_trace_cols=[&](int start_c,int end_c) {
+            Buffer<char> scratch;
+            for(int c=start_c;c<end_c;++c) {
+                switch(c) {
+                    case 0: cols[0]=encode_numeric<int64_t>(fields[0],0,n,[&](int64_t i){return trace[first+i].time;},scratch);break;
+                    case 1: cols[1]=encode_numeric<int32_t>(fields[1],0,n,[&](int64_t i){return trace[first+i].agent;},scratch);break;
+                    case 3: cols[3]=encode_strings(fields[3],0,n,[&](int64_t i){return trace[first+i].side;},scratch);break;
+                    case 4: cols[4]=encode_numeric<int64_t>(fields[4],0,n,[&](int64_t i){return trace[first+i].price;},scratch);break;
+                    case 5: cols[5]=encode_numeric<int64_t>(fields[5],0,n,[&](int64_t i){return trace[first+i].size;},scratch);break;
+                    case 6: cols[6]=encode_numeric<int64_t>(fields[6],0,n,[&](int64_t i){return trace[first+i].order_id;},scratch);break;
+                }
+            }
+        };
+        if(parallel&&n>=2048) {
+            auto f1=std::async(std::launch::async,[&](){encode_trace_cols(3,5);});
+            auto f2=std::async(std::launch::async,[&](){encode_trace_cols(5,7);});
+            encode_trace_cols(0,2);
+            f1.get();f2.get();
+        } else {
+            encode_trace_cols(0,2);
+            encode_trace_cols(3,7);
+        }
+        for(int c=0;c<7;++c) {
+            if(c==2) group.columns.push_back(cols[2].chunk);
+            else write_payload(group,std::move(cols[c]));
+        }
         groups.push_back(std::move(group));rows+=n;
     }
+
     std::string close() {
         if(deferred_types) {
-            int64_t first=0;
+            int64_t first=0;Buffer<char> scratch;
             for(auto& group:groups) {
-                Chunk chunk{6,8,group.n};strings(chunk,fields[2],0,group.n,[&](int64_t i){return type_codes[first+i];});
-                group.columns[2]=chunk;group.bytes+=chunk.uncompressed;group.compressed+=chunk.compressed;first+=group.n;
+                ColumnPayload cp=encode_strings(fields[2],0,group.n,[&](int64_t i){return type_codes[first+i];},scratch);
+                int64_t base_pos=output.position;
+                if(cp.rel_dict_offset>=0) cp.chunk.dict_offset=base_pos+cp.rel_dict_offset;
+                else cp.chunk.dict_offset=-1;
+                cp.chunk.data_offset=base_pos+cp.rel_data_offset;
+                output.write(cp.bytes.data(),cp.bytes.size());
+                group.columns[2]=cp.chunk;group.bytes+=cp.chunk.uncompressed;group.compressed+=cp.chunk.compressed;first+=group.n;
             }
         }
         auto bytes=footer(fields,groups,rows);output.write(bytes);Bytes end;little32(end,bytes.size());end.insert(end.end(),{'P','A','R','1'});output.write(end);return output.close();
@@ -397,8 +471,8 @@ std::vector<Field> ledger_schema() {
         {"msg_type",6,false,false,{"AGENT_WAKEUP","MarketClosePriceRequestMsg","MarketHoursRequestMsg","MarketHoursMsg","QuerySpreadMsg","QuerySpreadResponseMsg","LimitOrderMsg","CancelOrderMsg","OrderAcceptedMsg","OrderExecutedMsg","OrderCancelledMsg","MarketClosedMsg","MarketClosePriceMsg"}},
         {"order_id",2,true},{"causal_parent",2,true}};
 }
-std::string trace(const Core& core,const fs::path& path) {
-    Writer writer(path,trace_schema());
+std::string trace(const Core& core,const fs::path& path,bool parallel=false) {
+    Writer writer(path,trace_schema(),parallel);
     for(int64_t first=0;first<int64_t(core.trace.size());) {
         int64_t end=std::min(first+16384,int64_t(core.trace.size()));
         while(end<int64_t(core.trace.size())&&core.trace[end].time==core.trace[end-1].time) ++end;
@@ -410,8 +484,8 @@ void ledger_block(Writer& writer,const LedgerRow* input,int64_t n,int64_t first)
     if(n<=0) return;
     writer.append_ledger(input,n,first);
 }
-std::string ledger(const Core& core,const fs::path& path) {
-    Writer writer(path,ledger_schema());int64_t group=65536;
+std::string ledger(const Core& core,const fs::path& path,bool parallel=false) {
+    Writer writer(path,ledger_schema(),parallel);int64_t group=65536;
     if(group<1||group>1048576) throw std::invalid_argument("invalid row group size");
     for(int64_t first=0;first<int64_t(core.ledger.size());first+=group) {
         int64_t n=std::min(group,int64_t(core.ledger.size())-first);

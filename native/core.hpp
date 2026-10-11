@@ -281,17 +281,17 @@ public:
     i64 quote_time[2]={-1,-1};
     size_t quote_index[2]={0,0};
     Core(int count) : agents(count) {
-        trace.reserve(65536); ledger.reserve(65536);
+        trace.reserve(4096); ledger.reserve(4096);
 #ifdef T3_STANDALONE
         const char* option=std::getenv("T3SIM_TRACK_ALL_ORDERS");
         track_all_orders=option&&std::strcmp(option,"1")==0;
         messages.reserve(1024);free_slots.reserve(1024);
 #endif
     }
-    Msg make(int kind) { Msg m; m.id=next_msg++; m.kind=kind; return m; }
-    void wake(int agent, i64 time) {
+    inline __attribute__((always_inline)) Msg make(int kind) { Msg m; m.id=next_msg++; m.kind=kind; return m; }
+    inline __attribute__((always_inline)) void wake(int agent, i64 time) {
         Msg m=make(WAKE); m.src=agent; m.dst=agent; m.recv=time;
-        postpone(m,time);
+        postpone(std::move(m),time);
     }
     void enqueue(const Msg& m) { postpone(m,m.recv); }
     void enqueue(Msg&& m) { i64 time=m.recv; postpone(std::move(m),time); }
