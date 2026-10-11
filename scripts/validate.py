@@ -21,7 +21,13 @@ import uuid
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
+
+# Validation uses the same gates, but not a many-thread decode allocator that
+# retains large temporary buffers between complete-table comparisons.
+pa.set_cpu_count(1)
+pa.set_io_thread_count(1)
 
 
 def digest(path):

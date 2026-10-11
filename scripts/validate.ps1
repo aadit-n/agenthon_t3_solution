@@ -1,4 +1,4 @@
-param([string]$Image = 'agenthon-t3:latest')
+param([string]$Image = 'agenthon-t3:latest', [string]$OutputDirectory = 'results\v3-public')
 $ErrorActionPreference = 'Stop'
 $env:OPENBLAS_NUM_THREADS='1'
 $env:OMP_NUM_THREADS='1'
@@ -16,5 +16,5 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 docker build -t agenthon-t3-validator:local (Join-Path $projectRoot 'validation-wheels')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-& $pythonPath (Join-Path $PSScriptRoot 'run_public.py') --image $Image --isolated-scoring --output-dir (Join-Path $projectRoot 'results\v2-public')
+& $pythonPath (Join-Path $PSScriptRoot 'run_public.py') --image $Image --isolated-scoring --output-dir (Join-Path $projectRoot $OutputDirectory)
 exit $LASTEXITCODE

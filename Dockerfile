@@ -1,7 +1,8 @@
-FROM python:3.11-slim@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce AS dependencies
+FROM python:3.11-slim@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce AS base
 LABEL qfbench2.interface_version="2.0"
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/opt \
     OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+FROM base AS dependencies
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
@@ -37,5 +38,29 @@ RUN python /tmp/build-tools/prepare_build.py /opt \
     && find /opt -name '*.so' -exec strip --strip-unneeded {} \; \
     && python -m compileall -q /opt
 
-FROM sources AS final
+FROM sources AS cython
 COPY --from=compiler /opt /opt
+
+# The submission path is a standalone C++ process: no Python startup or callbacks.
+FROM toolchain AS cpp-compiler
+RUN apt-get update && apt-get install -y --no-install-recommends nlohmann-json3-dev libssl-dev
+COPY t3sim/native_types.hpp /opt/t3sim/native_types.hpp
+COPY native /opt/native
+COPY scripts/build_cpp.sh /tmp/build_cpp.sh
+RUN sh /tmp/build_cpp.sh
+
+FROM base AS final
+COPY --from=cpp-compiler /opt/t3sim-cpp /opt/t3sim-cpp
+COPY --from=dependencies /usr/local/lib/python3.11/site-packages/pyarrow/libarrow.so.1500 /usr/local/lib/python3.11/site-packages/pyarrow/libarrow.so.1500
+COPY --from=dependencies /usr/local/lib/python3.11/site-packages/pyarrow/libparquet.so.1500 /usr/local/lib/python3.11/site-packages/pyarrow/libparquet.so.1500
+COPY --from=dependencies /usr/local/lib/python3.11/site-packages/pyarrow-15.0.2.dist-info/LICENSE.txt /opt/licenses/arrow/LICENSE.txt
+COPY --from=dependencies /usr/local/lib/python3.11/site-packages/pyarrow-15.0.2.dist-info/NOTICE.txt /opt/licenses/arrow/NOTICE.txt
+COPY --from=cpp-compiler /usr/share/doc/nlohmann-json3-dev/copyright /opt/licenses/nlohmann-json-copyright
+COPY scripts/entrypoint_cpp.sh /usr/local/bin/entrypoint
+COPY LICENSE THIRD_PARTY_NOTICES.md SOURCE_PROVENANCE.json /opt/licenses/
+COPY vendor/abides/LICENSE* /opt/licenses/abides/
+COPY vendor/abides_fork/LICENSE /opt/licenses/adapter/LICENSE
+RUN chmod +x /usr/local/bin/entrypoint
+WORKDIR /work
+ENTRYPOINT ["entrypoint"]
+CMD ["--help"]

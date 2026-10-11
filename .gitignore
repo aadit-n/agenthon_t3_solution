@@ -10,5 +10,5 @@ __pycache__/
 *.c
 submission.json
 submission.zip
-./submissions
+submissions/
 vendor/abides

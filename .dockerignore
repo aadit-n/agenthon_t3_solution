@@ -8,6 +8,10 @@
 !scripts/
 !scripts/prepare_build.py
 !scripts/entrypoint.sh
+!scripts/entrypoint_cpp.sh
+!scripts/build_cpp.sh
+!native/
+!native/**
 !t3sim/
 !t3sim/**
 !vendor/

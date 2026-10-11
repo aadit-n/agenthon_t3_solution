@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=root / "results/public")
     parser.add_argument("--unit", action="append")
     parser.add_argument("--score-only", action="store_true")
+    parser.add_argument("--generate-only", action="store_true",help="generate outputs before separate differential/scoring checks")
     parser.add_argument('--isolated-scoring',action='store_true',help='fresh bounded validator for each unit')
     parser.add_argument('--resume-scoring',action='store_true',help='retain already passing unit reports')
     parser.add_argument('--scorer-memory',default='1g')
@@ -50,8 +51,11 @@ def main():
             runs.append({"unit": unit.name, "container_elapsed_sec": elapsed})
             (output / "run-times.json").write_text(json.dumps(runs, indent=2) + "\n")
             print(f"SIMULATED {unit.name} in {elapsed:.3f}s", flush=True)
+    if args.generate_only:
+        return 0
     command = ["docker", "run", "--rm", "--network", "none", "--cpus", "4",
                "--memory", args.scorer_memory, "--memory-swap", args.scorer_memory_swap,
+               "-e", "ARROW_DEFAULT_MEMORY_POOL=system", "-e", "MALLOC_ARENA_MAX=2",
                "-v", str(args.fixture.resolve()) + ":/references:ro",
                "-v", str(args.track_repo.resolve()) + ":/track:ro",
                "-v", str(root / "scripts") + ":/scripts:ro",

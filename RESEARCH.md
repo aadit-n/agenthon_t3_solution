@@ -16,7 +16,7 @@ This solution speeds up the organizer's stock-exchange simulator while preservin
 
 Searches included Agenthon-specific solutions and forks, ABIDES acceleration, C++/Rust event simulators, GPU limit-order-book implementations, and replay engines. The organizer's internal vectorized simulator is not published, so it is not available to reuse. No independently verified, ready-to-submit compatible solution was found in these searches. These conclusions are inferences from the reviewed interfaces and published material, not benchmark results for those projects.
 
-## Why this language and architecture
+## Original language and architecture
 
 The authored engine and helpers use Python syntax compiled to C by Cython. The runtime uses Python 3.11 with NumPy 1.26.4 and pandas 1.5.3, matching the organizer's reference stack. The scoring toolkit runs separately on its required Python 3.13. This keeps random draws and integer nanosecond timestamps compatible while removing Python dispatch overhead from hot modules.
 
@@ -54,3 +54,17 @@ Native NoiseTrader draws use NumPy's actual MT19937 bit-generator callbacks and 
 Configuration preserves the original global/private draw order. The sparse oracle's numerically unchanged methods are emitted from the vendored source without unused dense-oracle, pandas or kernel imports. Direct Arrow buffers avoid importing pandas while retaining its nullable integer metadata. The [Arrow 15 writer](https://arrow.apache.org/docs/15.0/python/generated/pyarrow.parquet.write_table.html) supports the string dictionaries and delta-packed integer columns used here. Parallel independent file writes and this layout improved large-case throughput by approximately 37% and 41%, respectively, in alternating three-repeat ablations.
 
 V2 again passes 71/71 units and all 95 markets exactly, plus six unseen-seed/parameter scenarios. Its local public single-pass mean is 428,466 self-reported events/s versus 42,521 for v1. Fresh same-machine startup-inclusive repeats show 2.60x, 4.08x, 26.68x and 2.28x improvements over v1 on mixed, medium, large and eight-market batch workloads. [Full results and limitations](results/v2-optimization/REPORT.md). These measurements do not establish an official Codabench rank or a global optimum.
+
+## Standalone C++ v3
+
+The user reported approximately 97k on Codabench for v2, following approximately 33k for v1. V3 removes Python from the submission execution path altogether. C++17 reuses the verified native structures and links the pinned [Arrow/Parquet C++ libraries bundled in PyArrow](https://arrow.apache.org/docs/15.0/_modules/pyarrow.html). The [native Parquet writer](https://arrow.apache.org/docs/cpp/parquet.html) exposes dictionary, numeric encoding and output-stream controls without interpreter startup; the implementation was compiled against the actual 15.0.2 wheel headers.
+
+The new RNG reproduces scalar-seeded MT19937, 53-bit uniform doubles, legacy cached polar normals, masked bounded integers, exponential, lognormal and Pareto draws. Linux/Windows math libraries produced tiny differences in early tests, so exact differential validation uses pinned Linux NumPy. The sparse oracle retains the reference's integer/floating timestamp distinction around shocks, global/private seed order, clipping and ties-to-even rounding. No fast-math or FMA contraction is used.
+
+Phase measurements motivated compact heap entries, recycled message slots, sorting equal-time runs, dense execution markers, activity-based buffer reservation, one-pass column construction, earlier row-buffer release, adaptive string/dictionary arrays, buffered writes and streaming hashing. The native job writes both required Parquet files, with all trace/ledger values checked.
+
+Controlled rotated/reversed trials found dictionary arrays reduce large-table cost and memory, while small batches benefit from strings and one writer per concurrent market. Snappy remains the default: uncompressed output and omitted optional statistics did not consistently improve the workload mix. Representations depend only on row count, preserving identical standalone/batch bytes.
+
+Replacing C++ with Rust would require another compatibility port with no measured advantage. GPU event processing, parallel dependent callbacks, optimistic rollback, calendar queues and altered random generators introduce ordering/numerical risks without demonstrated gains on these workloads. The current heap processes small live queues; output and container lifecycle remain significant costs after native dispatch. Independent-market parallelism uses the four-CPU budget.
+
+[The v3 report](results/v3-optimization/REPORT.md) binds correctness and repeated performance to an immutable image. These results support the changes; they do not prove a global optimum or predict the organizer's score.
