@@ -49,13 +49,34 @@ COPY native /opt/native
 COPY scripts/build_cpp.sh /tmp/build_cpp.sh
 RUN sh /tmp/build_cpp.sh
 
-FROM base AS final
+FROM base AS arrow
 COPY --from=cpp-compiler /opt/t3sim-cpp /opt/t3sim-cpp
 COPY --from=dependencies /usr/local/lib/python3.11/site-packages/pyarrow/libarrow.so.1500 /usr/local/lib/python3.11/site-packages/pyarrow/libarrow.so.1500
 COPY --from=dependencies /usr/local/lib/python3.11/site-packages/pyarrow/libparquet.so.1500 /usr/local/lib/python3.11/site-packages/pyarrow/libparquet.so.1500
 COPY --from=dependencies /usr/local/lib/python3.11/site-packages/pyarrow-15.0.2.dist-info/LICENSE.txt /opt/licenses/arrow/LICENSE.txt
 COPY --from=dependencies /usr/local/lib/python3.11/site-packages/pyarrow-15.0.2.dist-info/NOTICE.txt /opt/licenses/arrow/NOTICE.txt
 COPY --from=cpp-compiler /usr/share/doc/nlohmann-json3-dev/copyright /opt/licenses/nlohmann-json-copyright
+COPY scripts/entrypoint_cpp.sh /usr/local/bin/entrypoint
+COPY LICENSE THIRD_PARTY_NOTICES.md SOURCE_PROVENANCE.json /opt/licenses/
+COPY vendor/abides/LICENSE* /opt/licenses/abides/
+COPY vendor/abides_fork/LICENSE /opt/licenses/adapter/LICENSE
+RUN chmod +x /usr/local/bin/entrypoint
+WORKDIR /work
+ENTRYPOINT ["entrypoint"]
+CMD ["--help"]
+
+FROM cpp-compiler AS lite-compiler
+RUN apt-get update && apt-get install -y --no-install-recommends libsnappy-dev=1.2.2-1
+COPY scripts/build_lite.sh scripts/pgo_scenarios.py /tmp/
+ARG T3_BUILD_PGO=1
+RUN T3_BUILD_PGO=$T3_BUILD_PGO sh /tmp/build_lite.sh
+
+FROM base AS final
+ENV T3SIM_STREAM_LEDGER=1 T3SIM_STREAM_TRACE=auto T3SIM_LATENCY_PREFETCH=auto
+COPY --from=lite-compiler /opt/t3sim-cpp /opt/t3sim-cpp
+COPY --from=lite-compiler /usr/lib/x86_64-linux-gnu/libsnappy.so.1.2.2 /usr/lib/x86_64-linux-gnu/libsnappy.so.1
+COPY --from=lite-compiler /usr/share/doc/libsnappy1v5/copyright /opt/licenses/snappy/copyright
+COPY --from=lite-compiler /usr/share/doc/nlohmann-json3-dev/copyright /opt/licenses/nlohmann-json-copyright
 COPY scripts/entrypoint_cpp.sh /usr/local/bin/entrypoint
 COPY LICENSE THIRD_PARTY_NOTICES.md SOURCE_PROVENANCE.json /opt/licenses/
 COPY vendor/abides/LICENSE* /opt/licenses/abides/

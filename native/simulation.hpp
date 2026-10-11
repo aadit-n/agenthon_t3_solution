@@ -1,7 +1,8 @@
 #pragma once
 #define T3_STANDALONE
-#include "../t3sim/native_types.hpp"
+#include "core.hpp"
 #include "random.hpp"
+#include "latency_stream.hpp"
 #include <nlohmann/json.hpp>
 #include <memory>
 #include <string>
@@ -86,17 +87,23 @@ class Simulation {
     double latency_mu=0,latency_sigma=0,latency_min=0,latency_max=1e12,latency_alpha=1.5;
     i64 fixed_latency=0;
     std::vector<double> locations;
-    i64 latency_for(int sender,int recipient) {
-        if (sender==recipient) return 0;
-        if (latency_kind==4) return fixed_latency;
-        if (latency_kind==0) {
-            double distance=locations[sender]-locations[recipient];
-            return i64(std::sqrt(distance*distance)/0.299792458);
-        }
+    std::vector<i64> exchange_latencies;
+    std::unique_ptr<LatencyStream> latency_stream;
+    i64 sampled_latency() {
         double v=latency_kind==1?latency_rng.uniform(latency_min,latency_max):
                  latency_kind==2?latency_rng.lognormal(latency_mu,latency_sigma):
                  (latency_min>0?latency_min:1)*(1+latency_rng.pareto(latency_alpha));
         return i64(std::nearbyint(std::max(latency_min,std::min(latency_max,v))));
+    }
+    i64 latency_for(int sender,int recipient) {
+        if (sender==recipient) return 0;
+        if (latency_kind==4) return fixed_latency;
+        if (latency_kind==0) {
+            if(sender==0||recipient==0) return exchange_latencies[sender==0?recipient:sender];
+            double distance=locations[sender]-locations[recipient];
+            return i64(std::sqrt(distance*distance)/0.299792458);
+        }
+        return latency_stream?latency_stream->next():sampled_latency();
     }
     void send(int sender,int recipient,Msg msg) {
         msg.src=sender;msg.dst=recipient;msg.parent=c.causal;
@@ -196,7 +203,7 @@ class Simulation {
     }
 public:
     Core c;
-    explicit Simulation(const Json& scenario):global(scenario.at("seed").get<uint32_t>()),
+    explicit Simulation(const Json& scenario,bool parallel_latency=false):global(scenario.at("seed").get<uint32_t>()),
         oracle(scenario.at("oracle_config").value("params",Json::object()),global),latency_rng(0),c(count(scenario)) {
         c.now=DATE;c.open=DATE+34200000000000LL;c.close=c.open+scenario.at("horizon_ns").get<i64>();c.stop=c.close+1000000000;
         const auto& ex=scenario.at("exchange_config");
@@ -246,9 +253,18 @@ public:
         } else {
             latency_kind=0;locations.reserve(c.agents.size());
             for (size_t i=0;i<c.agents.size();++i) locations.push_back(latency_rng.uniform(0,3866660));
+            exchange_latencies.reserve(locations.size());
+            for(double position:locations) {double distance=locations[0]-position;exchange_latencies.push_back(i64(std::sqrt(distance*distance)/0.299792458));}
         }
         global.word(); // The otherwise unused kernel RandomState seed.
+        const char* prefetch=std::getenv("T3SIM_LATENCY_PREFETCH");
+        if(parallel_latency&&prefetch&&std::strcmp(prefetch,"off")!=0&&latency_kind>=1&&latency_kind<=3) {
+            long double workload=0;
+            for(size_t i=1;i<c.agents.size();++i) {const auto& a=c.agents[i];workload+=(1+static_cast<long double>(c.close-c.open)/a.interval)*(a.type==2?8*a.depth+6:8);}
+            if(std::strcmp(prefetch,"auto")!=0||workload>=32768) latency_stream=std::make_unique<LatencyStream>([this]{return sampled_latency();});
+        }
     }
+    void stop_latency() {latency_stream.reset();}
     void run() {
         c.wake(0,c.close);for (size_t i=0;i<c.agents.size();++i) c.wake(i,c.now);
         while (!c.empty()&&c.now&&c.now<=c.stop) {

@@ -1,4 +1,4 @@
-param([string]$Image = 'agenthon-t3:latest', [string]$OutputDirectory = 'results\v3-public')
+param([string]$Image = 'agenthon-t3:latest', [string]$OutputDirectory = 'results\v4-final-public')
 $ErrorActionPreference = 'Stop'
 $env:OPENBLAS_NUM_THREADS='1'
 $env:OMP_NUM_THREADS='1'

@@ -10,6 +10,8 @@
 !scripts/entrypoint.sh
 !scripts/entrypoint_cpp.sh
 !scripts/build_cpp.sh
+!scripts/build_lite.sh
+!scripts/pgo_scenarios.py
 !native/
 !native/**
 !t3sim/

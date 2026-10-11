@@ -134,7 +134,7 @@ struct StringColumn {
     int8_t* codes=nullptr;
     StringColumn(int64_t count,std::vector<std::string> names):n(count),labels(std::move(names)) {
         std::string mode=env("T3SIM_STRINGS","auto");
-        dictionary=mode=="dictionary"||(mode=="auto"&&n>=262144);
+        dictionary=mode=="dictionary"||(mode=="auto"&&(n>=262144||env("T3SIM_WRITER","arrow")=="pages"));
         if (dictionary) { data=checked(arrow::AllocateBuffer(n));codes=reinterpret_cast<int8_t*>(data->mutable_data());return; }
         size_t maximum=0;for (const auto& s:labels) maximum=std::max(maximum,s.size());
         offsets=checked(arrow::AllocateBuffer((n+1)*sizeof(int32_t)));data=checked(arrow::AllocateBuffer(n*maximum));
@@ -155,7 +155,7 @@ struct StringColumn {
 };
 std::shared_ptr<arrow::DataType> string_type(int64_t n) {
     std::string mode=env("T3SIM_STRINGS","auto");
-    return mode=="dictionary"||(mode=="auto"&&n>=262144)?arrow::dictionary(arrow::int8(),arrow::utf8()):arrow::utf8();
+    return mode=="dictionary"||(mode=="auto"&&(n>=262144||env("T3SIM_WRITER","arrow")=="pages"))?arrow::dictionary(arrow::int8(),arrow::utf8()):arrow::utf8();
 }
 std::shared_ptr<arrow::Table> trace_table(const Core& c) {
     if (env("T3SIM_COLUMN_ASSEMBLY","one-pass")=="legacy") return trace_table_legacy(c);
@@ -208,7 +208,9 @@ public:
         std::ostringstream stream;stream<<std::hex<<std::setfill('0');for (unsigned char b:result) stream<<std::setw(2)<<int(b);return stream.str();
     }
 };
+#include "fast_parquet.hpp"
 std::string write_parquet(const std::shared_ptr<arrow::Table>& table,const fs::path& path) {
+    if(env("T3SIM_WRITER","arrow")=="pages") return fastpq::write(table,path);
     parquet::WriterProperties::Builder properties;
     std::string codec=env("T3SIM_COMPRESSION","snappy");
     properties.compression(codec=="none"?parquet::Compression::UNCOMPRESSED:codec=="lz4"?parquet::Compression::LZ4:parquet::Compression::SNAPPY);
@@ -247,6 +249,27 @@ std::string write_parquet(const std::shared_ptr<arrow::Table>& table,const fs::p
 Json simulate(const fs::path& config_path,const fs::path& out,std::optional<uint32_t> seed={},std::optional<Time> since={},bool parallel_output=true) {
     Time start=since.value_or(Clock::now());Json scenario=read_json(config_path);if (seed) scenario["seed"]=*seed;
     Simulation simulation(scenario);double config_sec=seconds(start);Time loop=Clock::now();simulation.run();double loop_sec=seconds(loop);
+    if(env("T3SIM_PIPELINE","0")=="1"&&parallel_output) {
+        fs::path parent=out.parent_path();if(parent.empty()) parent=".";fs::create_directories(parent);
+        i64 n_events=simulation.c.trace.size(),n_messages=simulation.c.ledger.size();
+        struct Written {std::string hash;double assembly,writing;};
+        auto ledger_future=std::async(std::launch::async,[&]() {
+            Time phase=Clock::now();auto ledger=ledger_table(simulation.c);
+            std::vector<LedgerRow>().swap(simulation.c.ledger);double assembly=seconds(phase);
+            phase=Clock::now();auto hash=write_parquet(ledger,parent/"message_trace.parquet");return Written{hash,assembly,seconds(phase)};
+        });
+        Time phase=Clock::now();simulation.c.finish();double sort_sec=seconds(phase);
+        phase=Clock::now();auto trace=trace_table(simulation.c);std::vector<TraceRow>().swap(simulation.c.trace);double assembly_sec=seconds(phase);
+        phase=Clock::now();auto th=write_parquet(trace,out);double write_sec=seconds(phase);auto ledger=ledger_future.get();double elapsed=seconds(start);
+        Json result={{"scenario_id",scenario.at("scenario_id")},{"seed",scenario.at("seed")},{"n_events",n_events},{"n_messages",n_messages},
+            {"wall_clock_sec",elapsed},{"events_per_sec",n_events/elapsed},{"trace_sha256",th},{"message_trace_sha256",ledger.hash},
+            {"peak_memory_bytes",peak_memory()},{"gpu_seconds",0.},{"configuration_sec",config_sec},{"simulation_loop_sec",loop_sec},
+            {"sorting_sec",sort_sec},{"column_assembly_sec",std::max(assembly_sec,ledger.assembly)},
+            {"output_write_sec",std::max(write_sec,ledger.writing)},{"pipeline",true},
+            {"trace_column_assembly_sec",assembly_sec},{"ledger_column_assembly_sec",ledger.assembly},
+            {"trace_output_write_sec",write_sec},{"ledger_output_write_sec",ledger.writing}};
+        write_json(parent/"events.json",result);return result;
+    }
     Time sort=Clock::now();simulation.c.finish();double sort_sec=seconds(sort);
     Time assembly=Clock::now();auto trace=trace_table(simulation.c);
     std::vector<TraceRow>().swap(simulation.c.trace);

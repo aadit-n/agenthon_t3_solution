@@ -195,10 +195,7 @@ def write_report(report, folder):
         s = case["summary"]
         text.append(f"| {case['case']} | {case['workers'] or 1} | {s['events_per_sec']['median']:,.0f} | {s['messages_per_sec']['median']:,.0f} | {s['order_commands_per_sec']['median']:,.0f} | {s['container_sec']['median']:.3f} | {s['peak_cgroup_memory_bytes']/2**20:,.1f} | {s['average_cpu_cores']['median']:.2f} |")
     text += ["\nCPU cores is CPU-seconds divided by elapsed seconds: one busy core is 25% of the four-CPU quota. Peak cgroup memory includes all workers and charged file cache. Per-process RSS is also retained in JSON. Order commands include limit/market submission, cancel, modify, replace and partial cancel messages; they are not the leaderboard numerator.\n"]
-    if report['leader_score'] == 231024.2407:
-        text += [f"[Development leaderboard](https://www.agenthon.net/) reference verified on October 10, 2026: **fuzz — {report['leader_score']:,.4f} events/s**. This is a saved provisional Development score, not a controlled Final measurement or an automatically refreshed leaderboard.\n"]
-    else:
-        text += [f"User-specified comparison target: **{report['leader_score']:,.4f} events/s**.\n"]
+    text += [f"User-specified comparison target: **{report['leader_score']:,.4f} events/s**. This value is not a refreshed leaderboard reading or a controlled Final measurement.\n"]
     roster = report.get("prior_public_roster")
     if roster:
         declared = roster["arithmetic_mean_self_reported_events_per_sec"]

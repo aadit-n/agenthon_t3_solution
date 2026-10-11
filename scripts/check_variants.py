@@ -20,6 +20,7 @@ def main():
     parser.add_argument('--output-dir',type=Path,default=root/'results/variants')
     parser.add_argument('--extended',action='store_true',help='add adversarial native-port cases')
     parser.add_argument('--reference-dir',type=Path,help='reuse immutable baseline outputs from an earlier exact run')
+    parser.add_argument('--candidate-env',action='append',default=[],help='KEY=VALUE overrides for concurrency/encoding checks')
     args=parser.parse_args()
     original = json.loads((root.parent / "track3-simulation-public/units/t3-as01-base-mix/scenario.json").read_text())
     variants = []
@@ -98,7 +99,8 @@ def main():
         for label, image in (("baseline", args.baseline), ("candidate", args.candidate)):
             if label=='baseline' and args.reference_dir:continue
             launch(image, config, out / label, "simulate",
-                   ["--config", "/input/scenario.json", "--out", "/output/trace.parquet"])
+                   ["--config", "/input/scenario.json", "--out", "/output/trace.parquet"],
+                   dict(value.split('=',1) for value in args.candidate_env) if label=='candidate' else None)
         equality = {file: pq.read_table(reference / file).equals(
                     pq.read_table(out / "candidate" / file), check_metadata=False)
                     for file in ("trace.parquet", "message_trace.parquet")}
