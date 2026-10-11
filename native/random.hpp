@@ -29,7 +29,7 @@ public:
             state[i]=1812433253U*(state[i-1]^(state[i-1]>>30))+i;
     }
     uint32_t word() {
-        if (position==624) {
+        if (__builtin_expect(position==624, 0)) {
             for (int i=0;i<227;++i) {
                 uint32_t y=(state[i]&0x80000000U)|(state[i+1]&0x7fffffffU);
                 state[i]=state[i+397]^(y>>1)^((y&1)?0x9908b0dfU:0);

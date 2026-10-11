@@ -4,12 +4,13 @@
 #include "random.hpp"
 #include "latency_stream.hpp"
 #include "action_stream.hpp"
-#include <nlohmann/json.hpp>
+#include "json_view.hpp"
 #include <memory>
 #include <string>
+#include <optional>
 
 namespace t3 {
-using Json=nlohmann::json;
+using Json=JsonView;
 constexpr i64 DATE=1612483200000000000LL;
 
 // The reference mixes integer and floating timestamps around Poisson shocks.
@@ -120,15 +121,16 @@ class Simulation {
         }
         return action_latency?action_stream->next_latency():latency_stream?latency_stream->next():sampled_latency();
     }
-    void send(int sender,int recipient,Msg msg) {
+    void send(int sender,int recipient,Msg&& msg) {
         msg.src=sender;msg.dst=recipient;msg.parent=c.causal;
         msg.send=c.now+c.agents[sender].delay;
         if (sender==0&&(msg.kind==ACCEPTED||msg.kind==EXECUTED||msg.kind==CANCELLED)) msg.send+=c.ack_delay;
-        msg.arrive(latency_for(sender,recipient));c.enqueue(msg);
+        msg.arrive(latency_for(sender,recipient));c.enqueue(std::move(msg));
     }
+    void send(int sender,int recipient,const Msg& msg) { Msg copy=msg; send(sender,recipient,std::move(copy)); }
     void simple(int sender,int recipient,int kind) { send(sender,recipient,c.make(kind)); }
     void order_message(int sender,int kind,const Order& order) {
-        Msg msg=c.make(kind);msg.order=order;send(sender,sender?0:order.agent,msg);
+        Msg msg=c.make(kind);msg.order=order;send(sender,sender?0:order.agent,std::move(msg));
     }
     void place(int agent,i64 size,int side,i64 price) {
         Order o;o.id=c.next_order++;o.agent=agent;o.quantity=size;o.side=side;o.price=price;
@@ -156,21 +158,23 @@ class Simulation {
                 if (mid<fundamental-a.threshold&&ask) place(agent,size,0,ask);
                 else if (mid>fundamental+a.threshold&&bid) place(agent,size,1,bid);
             } else {
-                a.mids.push_back(mid);
-                if (a.mids.size()>size_t(a.lookback+1)) a.mids.erase(a.mids.begin());
-                if (a.mids.size()<=size_t(a.lookback)) return;
-                double past=a.mids.front();
+                if (a.mids.empty()) a.mids.resize(size_t(a.lookback+1),0.0);
+                a.mids[a.mid_head]=mid;
+                a.mid_head=(a.mid_head+1)%size_t(a.lookback+1);
+                ++a.mid_count;
+                if (a.mid_count<=size_t(a.lookback)) return;
+                double past=a.mids[a.mid_head];
                 if (mid>past+a.threshold&&ask) place(agent,size,0,ask);
                 else if (mid<past-a.threshold&&bid) place(agent,size,1,bid);
             }
         }
     }
-    void limit(Order order) {
-        if (order.quantity<=0||order.price<0) return;
+    inline __attribute__((always_inline)) void limit(Order order) {
+        if (__builtin_expect(order.quantity<=0||order.price<0, 0)) return;
         while (true) {
             if (c.book.cross(order)) {
                 Order resting=c.book.front(order.side);
-                if (c.stp&&resting.agent==order.agent) {
+                if (__builtin_expect(c.stp&&resting.agent==order.agent, 0)) {
                     if (c.stp==1) { resting=c.book.cancel(resting);order_message(0,CANCELLED,resting);continue; }
                     order_message(0,CANCELLED,order);break;
                 }
@@ -182,33 +186,33 @@ class Simulation {
         }
         c.quotes();
     }
-    void exchange(const Msg& msg) {
+    inline __attribute__((always_inline)) void exchange(const Msg& msg) {
         c.agents[0].delay=c.compute_delay;
-        if (c.now>c.close&&msg.kind!=QUERY) { simple(0,msg.src,CLOSED);return; }
+        if (__builtin_expect(c.now>c.close, 0)&&msg.kind!=QUERY) { simple(0,msg.src,CLOSED);return; }
         switch (msg.kind) {
-        case HOURS_REQ:c.agents[0].delay=0;simple(0,msg.src,HOURS);break;
-        case CLOSE_REQ:c.subscriptions.push_back(msg.src);break;
         case QUERY: {
             Msg response=c.make(SPREAD);response.spread(c.book.best_price(0),c.book.best_price(1),c.now>c.close);
-            send(0,msg.src,response);break;
+            send(0,msg.src,std::move(response));break;
         }
         case LIMIT:limit(msg.order);break;
         case CANCEL: { Order o=c.book.cancel(msg.order);if (o.id>=0) order_message(0,CANCELLED,o);break; }
+        case HOURS_REQ:c.agents[0].delay=0;simple(0,msg.src,HOURS);break;
+        case CLOSE_REQ:c.subscriptions.push_back(msg.src);break;
         default:throw std::runtime_error("unexpected exchange message");
         }
     }
-    void receive(const Msg& msg) {
+    inline __attribute__((always_inline)) void receive(const Msg& msg) {
         auto& a=c.agents[msg.dst];
         switch (msg.kind) {
-        case HOURS:
-            if (!a.hours) { a.hours=true;if (c.open<c.now) throw std::runtime_error("wakeup in past");c.wake(msg.dst,c.open); } break;
-        case CLOSED:a.closed=true;break;
+        case SPREAD:
+            if (__builtin_expect(msg.spread_closed(), 0)) a.closed=true;
+            if (a.awaiting) { if (__builtin_expect(!a.closed, 1)) act(msg.dst,msg.spread_bid(),msg.spread_ask());a.awaiting=false; } break;
         case EXECUTED:c.log(msg.dst,EXEC,msg.order);c.executed(msg.dst,msg.order);break;
         case ACCEPTED:c.log(msg.dst,ACCEPT,msg.order);break;
         case CANCELLED:c.log(msg.dst,CANCEL_EVENT,msg.order);c.cancelled(msg.dst,msg.order.id);break;
-        case SPREAD:
-            if (msg.spread_closed()) a.closed=true;
-            if (a.awaiting) { if (!a.closed) act(msg.dst,msg.spread_bid(),msg.spread_ask());a.awaiting=false; } break;
+        case HOURS:
+            if (!a.hours) { a.hours=true;if (c.open<c.now) throw std::runtime_error("wakeup in past");c.wake(msg.dst,c.open); } break;
+        case CLOSED:a.closed=true;break;
         case CLOSE_PRICE:break;
         default:throw std::runtime_error("unexpected agent message");
         }
@@ -218,8 +222,9 @@ class Simulation {
     }
 public:
     Core c;
-    explicit Simulation(const Json& scenario,bool parallel_latency=false):global(scenario.at("seed").get<uint32_t>()),
-        oracle(scenario.at("oracle_config").value("params",Json::object()),global),latency_rng(0),c(count(scenario)) {
+    explicit Simulation(const Json& scenario,std::optional<uint32_t> override_seed={},bool parallel_latency=false):
+        global(override_seed.value_or(scenario.at("seed").get<uint32_t>())),
+        oracle(scenario.at("oracle_config").value("params",Json()),global),latency_rng(0),c(count(scenario)) {
         c.now=DATE;c.open=DATE+34200000000000LL;c.close=c.open+scenario.at("horizon_ns").get<i64>();c.stop=c.close+1000000000;
         const auto& ex=scenario.at("exchange_config");
         if (ex.value("protocol_enforcement",false)) {
@@ -227,10 +232,10 @@ public:
             std::string stp=ex.contains("stp_policy")&&!ex["stp_policy"].is_null()?ex["stp_policy"].get<std::string>():std::string();
             c.stp=stp=="cancel_oldest"?1:(!stp.empty()?2:0);
         }
-        i64 reference=scenario.at("oracle_config").value("params",Json::object()).value("initial_price",i64(100000));
+        i64 reference=scenario.at("oracle_config").value("params",Json()).value("initial_price",i64(100000));
         rngs.reserve(c.agents.size());rngs.emplace_back(global.word());int index=1;
         for (const auto& group:scenario.at("agent_configs")) {
-            std::string kind=group.at("agent_type");const Json p=group.value("params",Json::object());
+            std::string kind=group.at("agent_type").get<std::string>();const Json p=group.value("params",Json());
             AgentState a;a.time=c.now;a.reference=reference;
             double hz=p.value("arrival_rate_hz",1.);
             a.interval=std::max<i64>(1,p.contains("rebalance_interval_ns")?p["rebalance_interval_ns"].get<i64>():hz>0?i64(1e9/hz):1000000000);
@@ -255,12 +260,12 @@ public:
                 trace_estimate+=actions*(a.type==2?8*a.depth:6);
                 ledger_estimate+=actions*(a.type==2?8*a.depth+6:8);
             }
-            c.trace.reserve(size_t(std::max(65536.L,std::min(2000000.L,trace_estimate))));
-            c.ledger.reserve(size_t(std::max(65536.L,std::min(2000000.L,ledger_estimate))));
+            c.trace.reserve(size_t(std::max(65536.L,std::min(262144.L,trace_estimate))));
+            c.ledger.reserve(size_t(std::max(65536.L,std::min(262144.L,ledger_estimate))));
         }
         latency_rng=Random(global.word());
         if (scenario.contains("latency_config")&&!scenario["latency_config"].is_null()&&!scenario["latency_config"].empty()) {
-            auto latency=scenario["latency_config"];Json p=latency.value("params",Json::object());
+            auto latency=scenario["latency_config"];Json p=latency.value("params",Json());
             std::string model=latency.value("model",std::string("deterministic"));
             latency_kind=model=="uniform"?1:model=="log_normal"?2:model=="pareto"?3:4;
             double mean=p.value("mean_ns",0.);latency_mu=mean>0?std::log(mean):0;
@@ -290,20 +295,20 @@ public:
     void stop_latency() {action_stream.reset();latency_stream.reset();}
     void run() {
         c.wake(0,c.close);for (size_t i=0;i<c.agents.size();++i) c.wake(i,c.now);
+        Msg msg;
         while (!c.empty()&&c.now&&c.now<=c.stop) {
 #ifdef T3_STANDALONE
             const auto& s=c.top_scheduled();
             if (c.agents[s.recipient()].time>s.time) { c.postpone_top(c.agents[s.recipient()].time);continue; }
-#endif
-#ifdef T3_REF_MESSAGES
+            c.pop_top_msg(s,msg);
+#elif defined(T3_REF_MESSAGES)
             Msg& msg=c.pop();
 #else
-            Msg msg=c.pop();
+            msg=c.pop();
 #endif
             auto& a=c.agents[msg.dst];
-            if (a.time>c.now) { c.postpone(msg,a.time);continue; }
             a.time=c.now;c.causal=msg.id;
-            if (msg.kind==WAKE) {
+            if (__builtin_expect(msg.kind==WAKE, 0)) {
                 msg.recv=c.now;c.delivered(msg);
                 if (msg.dst==0) {
                     if (c.now>=c.close) { Msg broadcast=c.make(CLOSE_PRICE);for (int sub:c.subscriptions) send(0,sub,broadcast); }

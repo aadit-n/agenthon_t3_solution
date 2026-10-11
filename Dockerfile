@@ -43,7 +43,7 @@ COPY --from=compiler /opt /opt
 
 # The submission path is a standalone C++ process: no Python startup or callbacks.
 FROM toolchain AS cpp-toolchain
-RUN apt-get update && apt-get install -y --no-install-recommends nlohmann-json3-dev libssl-dev
+RUN apt-get update && apt-get install -y --no-install-recommends nlohmann-json3-dev libssl-dev libsimdjson-dev
 
 FROM cpp-toolchain AS cpp-compiler
 COPY t3sim/native_types.hpp /opt/t3sim/native_types.hpp
@@ -68,7 +68,7 @@ ENTRYPOINT ["entrypoint"]
 CMD ["--help"]
 
 FROM cpp-toolchain AS lite-compiler
-RUN apt-get update && apt-get install -y --no-install-recommends libsnappy-dev=1.2.2-1
+RUN apt-get update && apt-get install -y --no-install-recommends libsnappy-dev=1.2.2-1 libsimdjson-dev
 COPY native /opt/native
 COPY scripts/build_lite.sh scripts/build_release.sh scripts/pgo_scenarios.py /tmp/
 ARG T3_BUILD_PGO=1

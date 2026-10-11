@@ -150,8 +150,9 @@ void delta_into(Bytes& out,const std::vector<T,Allocator>& values) {
     for(size_t first=1;first<values.size();first+=128) {
         size_t n=std::min(size_t(128),values.size()-first);T differences[128],minimum=std::numeric_limits<T>::max();
         for(size_t i=0;i<n;++i) {
-            U bits=U(values[first+i])-U(previous);T difference;std::memcpy(&difference,&bits,sizeof(T));
-            differences[i]=difference;minimum=std::min(minimum,difference);previous=values[first+i];
+            T curr=values[first+i];
+            T difference=static_cast<T>(U(curr)-U(previous));
+            differences[i]=difference;minimum=std::min(minimum,difference);previous=curr;
         }
         varint(out,zigzag(minimum));uint64_t normalized[128]={};int widths[4]={};
         for(size_t i=0;i<n;++i) normalized[i]=U(differences[i])-U(minimum);
@@ -206,12 +207,12 @@ std::string pandas(const std::vector<Field>& fields) {
     if(!fields.empty()&&fields[0].name=="seq") {
         return "{\"column_indexes\":[],\"columns\":[{\"field_name\":\"seq\",\"metadata\":null,\"name\":\"seq\",\"numpy_type\":\"int64\",\"pandas_type\":\"int64\"},{\"field_name\":\"t_recv_ns\",\"metadata\":null,\"name\":\"t_recv_ns\",\"numpy_type\":\"int64\",\"pandas_type\":\"int64\"},{\"field_name\":\"t_send_ns\",\"metadata\":null,\"name\":\"t_send_ns\",\"numpy_type\":\"Int64\",\"pandas_type\":\"int64\"},{\"field_name\":\"latency_ns\",\"metadata\":null,\"name\":\"latency_ns\",\"numpy_type\":\"int64\",\"pandas_type\":\"int64\"},{\"field_name\":\"src_id\",\"metadata\":null,\"name\":\"src_id\",\"numpy_type\":\"int32\",\"pandas_type\":\"int32\"},{\"field_name\":\"dst_id\",\"metadata\":null,\"name\":\"dst_id\",\"numpy_type\":\"int32\",\"pandas_type\":\"int32\"},{\"field_name\":\"message_id\",\"metadata\":null,\"name\":\"message_id\",\"numpy_type\":\"int64\",\"pandas_type\":\"int64\"},{\"field_name\":\"msg_type\",\"metadata\":null,\"name\":\"msg_type\",\"numpy_type\":\"string\",\"pandas_type\":\"unicode\"},{\"field_name\":\"order_id\",\"metadata\":null,\"name\":\"order_id\",\"numpy_type\":\"Int64\",\"pandas_type\":\"int64\"},{\"field_name\":\"causal_parent\",\"metadata\":null,\"name\":\"causal_parent\",\"numpy_type\":\"Int64\",\"pandas_type\":\"int64\"}],\"creator\":{\"library\":\"agenthon-t3\",\"version\":\"4.0\"},\"index_columns\":[],\"pandas_version\":\"1.5.3\"}";
     }
-    Json columns=Json::array();
+    nlohmann::json columns=nlohmann::json::array();
     for(const auto& f:fields) {
         bool string=f.physical==6;std::string type=string?"unicode":f.physical==1?"int32":"int64";
         columns.push_back({{"name",f.name},{"field_name",f.name},{"pandas_type",type},{"numpy_type",f.nullable?"Int64":string?"string":type},{"metadata",nullptr}});
     }
-    return Json({{"index_columns",Json::array()},{"column_indexes",Json::array()},{"columns",columns},
+    return nlohmann::json({{"index_columns",nlohmann::json::array()},{"column_indexes",nlohmann::json::array()},{"columns",columns},
         {"creator",{{"library","agenthon-t3"},{"version","4.0"}}},{"pandas_version","1.5.3"}}).dump();
 }
 Bytes footer(const std::vector<Field>& fields,const std::vector<Group>& groups,int64_t rows) {
@@ -261,7 +262,8 @@ class Writer {
             p.object(5,[&](Compact& h){h.integer(1,count);h.integer(2,chunk.encoding);h.integer(3,3);h.integer(4,3);});chunk.data_offset=output.position;
         }
         p.end();chunk.uncompressed+=header.size()+raw.size();chunk.compressed+=header.size()+size;
-        output.write(header);output.write(compressed.data(),size);
+        header.insert(header.end(),reinterpret_cast<const uint8_t*>(compressed.data()),reinterpret_cast<const uint8_t*>(compressed.data())+size);
+        output.write(header.data(),header.size());
     }
     template<class T,class F> void numeric(Chunk& chunk,const Field& field,int64_t first,int64_t n,F get) {
 #ifdef T3_IMPLICIT_SEQUENCE

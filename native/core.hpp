@@ -167,6 +167,7 @@ struct AgentState {
     std::map<i64,Order> open;
 #endif
     std::vector<double> mids;
+    size_t mid_head=0, mid_count=0;
 };
 struct Level { std::list<i64> fifo; i64 quantity=0; };
 struct Resting { Order order; std::list<i64>::iterator position; };
@@ -293,18 +294,21 @@ public:
         postpone(m,time);
     }
     void enqueue(const Msg& m) { postpone(m,m.recv); }
+    void enqueue(Msg&& m) { i64 time=m.recv; postpone(std::move(m),time); }
     void delivered(const Msg& m) {
         ledger.push_back(LedgerRow{m.id,m.send,m.recv,m.delivery_latency(),m.parent,m.order.id,m.src,m.dst,m.kind});
         ++total_messages;
-        if(ledger_sink&&ledger.size()==65536) {
+        if(ledger_sink && __builtin_expect(ledger.size()>=65536, 0)) {
             ledger_sink(std::move(ledger));ledger=std::vector<LedgerRow>();ledger.reserve(65536);
         }
     }
     bool empty() const { return queue.empty(); }
     void trace_boundary(i64 next_time) {
-        if(trace_sink&&next_time!=now&&trace.size()>=16384) {
-            i64 count=trace.size();trace_sink(std::move(trace));trace_base+=count;
-            trace=std::vector<TraceRow>();trace.reserve(16384);
+        if(trace_sink && __builtin_expect(trace.size()>=16384, 0)) {
+            if(next_time!=now) {
+                i64 count=trace.size();trace_sink(std::move(trace));trace_base+=count;
+                trace=std::vector<TraceRow>();trace.reserve(16384);
+            }
         }
     }
 #ifdef T3_STANDALONE
@@ -326,6 +330,13 @@ public:
 #ifdef T3_REF_MESSAGES
     Msg& pop() {
 #else
+#ifdef T3_STANDALONE
+    void pop_top_msg(const CompactScheduled& s, Msg& out) {
+        i64 t=s.time; uint32_t slot=s.slot;
+        queue.pop(); trace_boundary(t); now=t;
+        out=std::move(messages[slot]); free_slots.push_back(slot);
+    }
+#endif
     Msg pop() {
 #endif
 #ifdef T3_STANDALONE
@@ -361,6 +372,20 @@ public:
         queue.push(CompactScheduled{time,m.id,m.src,m.dst,slot});
 #else
         queue.push(Scheduled{time,m});
+#endif
+    }
+    void postpone(Msg&& m, i64 time) {
+#ifdef T3_STANDALONE
+        uint32_t slot;
+#ifdef T3_REF_MESSAGES
+        if(held_message!=UINT32_MAX && &m==&messages[held_message]) {slot=held_message;held_message=UINT32_MAX;}
+        else
+#endif
+        if (free_slots.empty()) { slot=messages.size();messages.push_back(std::move(m)); }
+        else { slot=free_slots.back();free_slots.pop_back();messages[slot]=std::move(m); }
+        queue.push(CompactScheduled{time,messages[slot].id,messages[slot].src,messages[slot].dst,slot});
+#else
+        queue.push(Scheduled{time,std::move(m)});
 #endif
     }
     void log(int agent, int kind, const Order& o) {
