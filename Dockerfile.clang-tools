@@ -1,0 +1,2 @@
+FROM agenthon-t3-build-lite:v4
+RUN apt-get update && apt-get install -y --no-install-recommends clang lld

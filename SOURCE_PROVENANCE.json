@@ -116,5 +116,19 @@
       "license": "BSD-3-Clause"
     },
     "recovered_v3_core_sha256": "6dba76fe1ecebbdfc81a38618aafdb54f17eee5f2c0fdaf58af0c09f4d9cce00"
+  },
+  "native_v5": {
+    "language": "C++17",
+    "compiler_options": "scripts/build_release.sh; -O3 -ffp-contract=off -fno-math-errno -flto -fprofile-use; generic amd64, SSE2 baseline; no fast-math",
+    "compiler_training": "15 generated synthetic scenarios; small and streamed single markets plus four-worker batches; profiles and outputs excluded from runtime",
+    "scheduler": "independently authored radix queue with exact sender/recipient/message-ID ties and general-heap fallback for nonmonotone input",
+    "runtime_compressor": "unchanged Debian Snappy 1.2.2-1; experimental CPU-specific compression is not selected",
+    "snappy_research_vendor": {
+      "version": "1.2.2",
+      "source": "https://github.com/google/snappy/tree/1.2.2",
+      "archive_sha256": "90f74bc1fbf78a6c56b3c4a082a05103b3a56bb17bca1a27e052ea11723292dc",
+      "license": "BSD-3-Clause",
+      "purpose": "local compression experiments only; excluded from Docker context and runtime"
+    }
   }
 }

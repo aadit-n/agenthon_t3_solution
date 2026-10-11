@@ -89,7 +89,7 @@ Json simulate(const fs::path& config,const fs::path& out,std::optional<uint32_t>
         std::vector<LedgerRow>().swap(simulation.c.ledger);simulation.c.ledger.reserve(65536);
         double config_sec=seconds(start);Time phase=Clock::now();simulation.run();simulation.stop_latency();double loop_sec=seconds(phase);
         simulation.c.ledger_sink={};messages.submit(std::move(simulation.c.ledger));
-        phase=Clock::now();simulation.c.finish();double sort_sec=seconds(phase);phase=Clock::now();
+        phase=Clock::now();simulation.c.finish(false);double sort_sec=seconds(phase);phase=Clock::now();
         auto th=litepq::trace(simulation.c,out);auto ledger=messages.finish();double output_sec=seconds(phase),elapsed=seconds(start);i64 events=simulation.c.trace.size();
         Json result={{"scenario_id",scenario.at("scenario_id")},{"seed",scenario.at("seed")},{"n_events",events},{"n_messages",simulation.c.total_messages},
             {"wall_clock_sec",elapsed},{"events_per_sec",events/elapsed},{"trace_sha256",th},{"message_trace_sha256",ledger.first},
@@ -103,7 +103,7 @@ Json simulate(const fs::path& config,const fs::path& out,std::optional<uint32_t>
     if(concurrent&&env("T3SIM_LITE_PIPELINE","1")=="1") ledger=std::async(std::launch::async,[&]() {
         Time begin=Clock::now();auto hash=litepq::ledger(simulation.c,parent/"message_trace.parquet");return Written{hash,seconds(begin)};
     });
-    Time phase=Clock::now();simulation.c.finish();double sort_sec=seconds(phase);phase=Clock::now();
+    Time phase=Clock::now();simulation.c.finish(false);double sort_sec=seconds(phase);phase=Clock::now();
     auto th=litepq::trace(simulation.c,out);double trace_sec=seconds(phase);Written messages;
     if(ledger) messages=ledger->get();else {phase=Clock::now();messages={litepq::ledger(simulation.c,parent/"message_trace.parquet"),seconds(phase)};}
     double pipeline_sec=seconds(pipeline),elapsed=seconds(start);i64 events=simulation.c.trace.size();
@@ -142,7 +142,7 @@ void random_test(const fs::path& config,const fs::path& out) {
 int main(int argc,char** argv) {
     Time start=Clock::now();
     try {
-        if(argc<2||std::string(argv[1])=="--help") {std::cout<<"Agenthon T3 native simulator v4\nsimulate --config FILE --out FILE [--seed N]\nsimulate-batch --batch-dir DIR --out-dir DIR [--workers 1..4]\n";return 0;}
+        if(argc<2||std::string(argv[1])=="--help") {std::cout<<"Agenthon T3 native simulator v5\nsimulate --config FILE --out FILE [--seed N]\nsimulate-batch --batch-dir DIR --out-dir DIR [--workers 1..4]\n";return 0;}
         std::map<std::string,std::string> args;for(int i=2;i<argc;i+=2) {if(i+1>=argc) throw std::invalid_argument("missing option value");args[argv[i]]=argv[i+1];}
         std::string command=argv[1];Json result;
         if(command=="simulate") {

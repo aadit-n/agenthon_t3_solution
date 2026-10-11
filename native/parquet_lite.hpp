@@ -1,17 +1,58 @@
 #pragma once
 #include <snappy.h>
 #include <openssl/evp.h>
+#include <openssl/sha.h>
 #include <cstdio>
 #include <functional>
 #include <limits>
 #include <type_traits>
+#ifdef T3_FAST_SNAPPY
+namespace snappy_fast {void RawCompress(const char*,size_t,char*,size_t*);}
+#endif
+#ifdef T3_CACHED_SNAPPY
+void cached_snappy(const char*,size_t,char*,size_t*);
+void cached_snappy_fast(const char*,size_t,char*,size_t*);
+#endif
 
 // Independently authored implementation of the flat subset required by T3:
 // optional INT32/INT64/UTF8, Snappy, delta integers, categorical dictionaries,
 // data pages v1, compact-protocol footer, and pandas nullable-integer metadata.
 // No Arrow tables, object conversion, reflection, or general nested schemas.
 namespace litepq {
-using Bytes=std::vector<uint8_t>;
+template<class T> struct UninitializedAllocator:std::allocator<T> {
+    using value_type=T;
+    template<class U> struct rebind {using other=UninitializedAllocator<U>;};
+    UninitializedAllocator()=default;
+    template<class U> UninitializedAllocator(const UninitializedAllocator<U>&) {}
+    template<class U,class... Args> void construct(U* pointer,Args&&... args) {
+        if constexpr(sizeof...(Args)==0) ::new(static_cast<void*>(pointer)) U;
+        else ::new(static_cast<void*>(pointer)) U(std::forward<Args>(args)...);
+    }
+};
+#ifdef T3_UNINITIALIZED_BYTES
+template<class T> using Buffer=std::vector<T,UninitializedAllocator<T>>;
+#else
+template<class T> using Buffer=std::vector<T>;
+#endif
+using Compress=void(*)(const char*,size_t,char*,size_t*);
+Compress compressor() {
+#ifdef T3_CACHED_SNAPPY
+    bool cache=env("T3SIM_CACHE_SNAPPY","1")!="0";
+#endif
+#ifdef T3_FAST_SNAPPY
+    if(env("T3SIM_FAST_SNAPPY","auto")!="off"&&__builtin_cpu_supports("avx2")&&__builtin_cpu_supports("bmi2")&&__builtin_cpu_supports("sse4.2")&&__builtin_cpu_supports("ssse3")) {
+#ifdef T3_CACHED_SNAPPY
+        if(cache) return cached_snappy_fast;
+#endif
+        return snappy_fast::RawCompress;
+    }
+#endif
+#ifdef T3_CACHED_SNAPPY
+    if(cache) return cached_snappy;
+#endif
+    return snappy::RawCompress;
+}
+using Bytes=Buffer<uint8_t>;
 void varint(Bytes& out,uint64_t value) {
     while(value>=128) {out.push_back(uint8_t(value)|128);value>>=7;}out.push_back(uint8_t(value));
 }
@@ -33,23 +74,40 @@ struct Compact {
     void end() {bytes.push_back(0);}
 };
 struct Output {
-    std::FILE* file=nullptr;int64_t position=0;std::vector<char> buffering;
+    std::FILE* file=nullptr;int64_t position=0;Buffer<char> buffering;
+#ifdef T3_DIRECT_HASH
+    SHA256_CTX hash;
+#else
     std::unique_ptr<EVP_MD_CTX,decltype(&EVP_MD_CTX_free)> hash{EVP_MD_CTX_new(),EVP_MD_CTX_free};
+#endif
     explicit Output(const fs::path& path):buffering(1048576) {
         file=std::fopen(path.c_str(),"wb");if(!file) throw std::runtime_error("cannot open "+path.string());
         std::setvbuf(file,buffering.data(),_IOFBF,buffering.size());
+#ifdef T3_DIRECT_HASH
+        if(SHA256_Init(&hash)!=1) {std::fclose(file);file=nullptr;throw std::runtime_error("hash init");}
+#else
         if(!hash||EVP_DigestInit_ex(hash.get(),EVP_sha256(),nullptr)!=1) {std::fclose(file);file=nullptr;throw std::runtime_error("hash init");}
+#endif
     }
     ~Output() {if(file) std::fclose(file);}
     void write(const void* data,size_t bytes) {
         if(std::fwrite(data,1,bytes,file)!=bytes) throw std::runtime_error("Parquet write failed");
-        if(EVP_DigestUpdate(hash.get(),data,bytes)!=1) throw std::runtime_error("hash update");position+=bytes;
+#ifdef T3_DIRECT_HASH
+        if(SHA256_Update(&hash,data,bytes)!=1) throw std::runtime_error("hash update");
+#else
+        if(EVP_DigestUpdate(hash.get(),data,bytes)!=1) throw std::runtime_error("hash update");
+#endif
+        position+=bytes;
     }
     void write(const Bytes& bytes) {write(bytes.data(),bytes.size());}
     std::string close() {
         int status=std::fclose(file);file=nullptr;if(status) throw std::runtime_error("Parquet close failed");
         unsigned char result[32];unsigned int size;
+#ifdef T3_DIRECT_HASH
+        if(SHA256_Final(result,&hash)!=1) throw std::runtime_error("hash finish");
+#else
         if(EVP_DigestFinal_ex(hash.get(),result,&size)!=1) throw std::runtime_error("hash finish");
+#endif
         static const char digits[]="0123456789abcdef";std::string out(64,'0');
         for(int i=0;i<32;++i) {out[i*2]=digits[result[i]>>4];out[i*2+1]=digits[result[i]&15];}return out;
     }
@@ -81,8 +139,12 @@ void bitpack32(Bytes& out,const uint64_t* values,int width) {
     #undef LITE_PACK_CASE
 }
 int bit_width(uint64_t value) {return value?64-__builtin_clzll(value):0;}
-template<class T> Bytes delta(const std::vector<T>& values) {
-    Bytes out;out.reserve(values.size()*sizeof(T)/2+64);
+template<class T,class Allocator>
+#ifdef T3_VECTOR_DELTA
+__attribute__((target_clones("avx2","default")))
+#endif
+void delta_into(Bytes& out,const std::vector<T,Allocator>& values) {
+    out.reserve(out.size()+values.size()*sizeof(T)/2+64);
     varint(out,128);varint(out,4);varint(out,values.size());varint(out,zigzag(values.empty()?0:values[0]));
     using U=std::make_unsigned_t<T>;T previous=values.empty()?0:values[0];
     for(size_t first=1;first<values.size();first+=128) {
@@ -99,9 +161,33 @@ template<class T> Bytes delta(const std::vector<T>& values) {
         }
         for(int mini=0;mini<4;++mini) bitpack32(out,normalized+mini*32,widths[mini]);
     }
+}
+template<class T,class Allocator> Bytes delta(const std::vector<T,Allocator>& values) {Bytes out;delta_into(out,values);return out;}
+template<int WIDTH,class F> Bytes narrow_indices(int64_t n,F get) {
+    Bytes out;out.reserve(size_t((n+7)/8*WIDTH+16));out.push_back(uint8_t(WIDTH));varint(out,uint64_t((n+7)/8)*2+1);
+    size_t prefix=out.size();out.resize(prefix+size_t((n+7)/8)*WIDTH);
+    int64_t full=n/8*8;
+    for(int64_t first=0;first<full;first+=8) {
+        uint64_t packed=0;
+        #pragma GCC unroll 8
+        for(int i=0;i<8;++i) packed|=uint64_t(get(first+i))<<(i*WIDTH);
+        std::memcpy(out.data()+prefix+size_t(first/8)*WIDTH,&packed,WIDTH);
+    }
+    if(full<n) {
+        uint64_t packed=0;for(int i=0;full+i<n;++i) packed|=uint64_t(get(full+i))<<(i*WIDTH);
+        std::memcpy(out.data()+prefix+size_t(full/8)*WIDTH,&packed,WIDTH);
+    }
     return out;
 }
 template<class F> Bytes dictionary_indices(int64_t n,int width,F get) {
+#ifdef T3_NARROW_CODES
+    switch(width) {
+        case 1:return narrow_indices<1>(n,get);case 2:return narrow_indices<2>(n,get);
+        case 3:return narrow_indices<3>(n,get);case 4:return narrow_indices<4>(n,get);
+        case 5:return narrow_indices<5>(n,get);case 6:return narrow_indices<6>(n,get);
+        case 7:return narrow_indices<7>(n,get);case 8:return narrow_indices<8>(n,get);
+    }
+#endif
     Bytes out;out.reserve(size_t((n+7)/8*width+16));out.push_back(uint8_t(width));varint(out,uint64_t((n+7)/8)*2+1);
     for(int64_t first=0;first<n;first+=8) {
         __uint128_t packed=0;
@@ -151,14 +237,16 @@ Bytes footer(const std::vector<Field>& fields,const std::vector<Group>& groups,i
     file.binary(6,"agenthon-t3 native flat writer 4.0");file.end();return bytes;
 }
 class Writer {
-    Output output;std::vector<Field> fields;std::vector<Group> groups;std::string compressed;
+    Compress compress=compressor();
+    Output output;std::vector<Field> fields;std::vector<Group> groups;Buffer<char> compressed;
     int64_t rows=0;
     bool deferred_types=false;
     std::vector<uint8_t> type_codes;
     std::vector<size_t> last_execution;
+    bool plain_numeric=env("T3SIM_LITE_ENCODING","delta")=="plain";
     void page(Chunk& chunk,const Bytes& raw,int count,bool dictionary) {
         compressed.resize(snappy::MaxCompressedLength(raw.size()));size_t size=compressed.size();
-        snappy::RawCompress(reinterpret_cast<const char*>(raw.data()),raw.size(),compressed.data(),&size);compressed.resize(size);
+        compress(reinterpret_cast<const char*>(raw.data()),raw.size(),compressed.data(),&size);compressed.resize(size);
         if(raw.size()>INT32_MAX||size>INT32_MAX) throw std::runtime_error("Parquet page too large");
         Bytes header;Compact p{header};p.integer(1,dictionary?2:0);p.integer(2,raw.size());p.integer(3,size);
         if(dictionary) {
@@ -170,11 +258,39 @@ class Writer {
         output.write(header);output.write(compressed.data(),size);
     }
     template<class T,class F> void numeric(Chunk& chunk,const Field& field,int64_t first,int64_t n,F get) {
+#ifdef T3_IMPLICIT_SEQUENCE
+        if(field.name=="seq"&&!plain_numeric) {
+            Bytes levels;varint(levels,uint64_t(n)*2);levels.push_back(1);
+            Bytes raw;raw.reserve(size_t(n/128*5+32));little32(raw,levels.size());raw.insert(raw.end(),levels.begin(),levels.end());
+            varint(raw,128);varint(raw,4);varint(raw,n);varint(raw,zigzag(get(first)));
+            for(int64_t i=1;i<n;i+=128) {varint(raw,2);raw.insert(raw.end(),4,0);}
+            chunk.encoding=5;page(chunk,raw,int(n),false);return;
+        }
+#endif
+#ifdef T3_INDEXED_VALUES
+        Buffer<T> values;values.resize(n);size_t valid=0;Bytes levels;
+#else
         std::vector<T> values;values.reserve(n);Bytes levels;
+#endif
         if(field.nullable) {
             varint(levels,uint64_t((n+7)/8)*2+1);size_t prefix=levels.size();levels.resize(prefix+size_t((n+7)/8),0);
-            for(int64_t i=0;i<n;++i) {T value=T(get(first+i));if(value>=0) {values.push_back(value);levels[prefix+size_t(i/8)]|=uint8_t(1<<(i%8));}}
-        } else {varint(levels,uint64_t(n)*2);levels.push_back(1);for(int64_t i=0;i<n;++i) values.push_back(T(get(first+i)));}
+            for(int64_t i=0;i<n;++i) {T value=T(get(first+i));if(value>=0) {
+#ifdef T3_INDEXED_VALUES
+                values[valid++]=value;
+#else
+                values.push_back(value);
+#endif
+                levels[prefix+size_t(i/8)]|=uint8_t(1<<(i%8));}}
+#ifdef T3_INDEXED_VALUES
+            values.resize(valid);
+#endif
+        } else {varint(levels,uint64_t(n)*2);levels.push_back(1);for(int64_t i=0;i<n;++i) {
+#ifdef T3_INDEXED_VALUES
+            values[i]=T(get(first+i));
+#else
+            values.push_back(T(get(first+i)));
+#endif
+        }}
         Bytes raw;little32(raw,levels.size());raw.insert(raw.end(),levels.begin(),levels.end());
         bool dictionary=false;
         if(field.categorical&&env("T3SIM_LITE_DICT","0")=="1"&&!values.empty()) {
@@ -186,8 +302,15 @@ class Writer {
                 raw.insert(raw.end(),indices.begin(),indices.end());dictionary=true;
             }
         }
-        if(!dictionary) {
+        if(!dictionary&&plain_numeric) {
+            chunk.encoding=0;size_t first=raw.size();raw.resize(first+values.size()*sizeof(T));
+            if(!values.empty()) std::memcpy(raw.data()+first,values.data(),values.size()*sizeof(T));
+        } else if(!dictionary) {
+#ifdef T3_FUSED_DELTA
+            chunk.encoding=5;delta_into(raw,values);
+#else
             auto encoded=delta(values);chunk.encoding=5;raw.insert(raw.end(),encoded.begin(),encoded.end());
+#endif
         }
         page(chunk,raw,int(n),false);
     }
@@ -213,8 +336,15 @@ public:
     }
     void append_trace(const std::vector<TraceRow>& trace,int64_t first,int64_t n) {
         if(n<=0) return;deferred_types=true;Group group{n};group.columns.reserve(fields.size());
+#ifdef T3_COLUMNAR_WRITER
+        std::unique_ptr<i64[]> columns(new i64[size_t(n)*7]);
+#endif
         for(int64_t i=0;i<n;++i) {
             const auto& row=trace[first+i];int kind=row.kind;
+#ifdef T3_COLUMNAR_WRITER
+            columns[i]=row.time;columns[n+i]=row.agent;columns[3*n+i]=row.side;
+            columns[4*n+i]=row.price;columns[5*n+i]=row.size;columns[6*n+i]=row.order_id;
+#endif
             if(kind==EXEC) {
                 if(row.order_id<0) throw std::runtime_error("execution has no order ID");
                 if(size_t(row.order_id)>=last_execution.size()) last_execution.resize(size_t(row.order_id)+1,SIZE_MAX);
@@ -225,7 +355,11 @@ public:
         }
         for(size_t col=0;col<fields.size();++col) {
             const auto& field=fields[col];Chunk chunk{field.physical,8,n};
+#ifdef T3_COLUMNAR_WRITER
+            const i64* column=columns.get()+col*n;auto value=[&](int64_t i)->i64 {return column[i];};
+#else
             auto value=[&](int64_t i)->i64 {const auto& r=trace[first+i];switch(col) {case 0:return r.time;case 1:return r.agent;case 3:return r.side;case 4:return r.price;case 5:return r.size;default:return r.order_id;}};
+#endif
             if(col!=2) {
                 if(field.physical==6) strings(chunk,field,0,n,value);
                 else if(field.physical==1) numeric<int32_t>(chunk,field,0,n,value);
@@ -264,16 +398,30 @@ std::string trace(const Core& core,const fs::path& path) {
     }
     return writer.close();
 }
+void ledger_block(Writer& writer,const LedgerRow* input,int64_t n,int64_t first) {
+    if(n<=0) return;
+#ifdef T3_COLUMNAR_WRITER
+    std::unique_ptr<i64[]> columns(new i64[size_t(n)*10]);
+    for(int64_t i=0;i<n;++i) {
+        const auto& row=input[i];columns[i]=first+i;columns[n+i]=row.recv;columns[2*n+i]=row.send;
+        columns[3*n+i]=row.latency;columns[4*n+i]=row.src;columns[5*n+i]=row.dst;
+        columns[6*n+i]=row.id;columns[7*n+i]=row.kind;columns[8*n+i]=row.order_id;columns[9*n+i]=row.parent;
+    }
+    writer.append(n,[&](size_t col,int64_t i)->i64 {return columns[col*n+i];});
+#else
+    writer.append(n,[&](size_t col,int64_t i)->i64 {const auto& r=input[i];switch(col) {case 0:return first+i;case 1:return r.recv;case 2:return r.send;case 3:return r.latency;case 4:return r.src;case 5:return r.dst;case 6:return r.id;case 7:return r.kind;case 8:return r.order_id;default:return r.parent;}});
+#endif
+}
 std::string ledger(const Core& core,const fs::path& path) {
     Writer writer(path,ledger_schema());int64_t group=65536;
     if(group<1||group>1048576) throw std::invalid_argument("invalid row group size");
     for(int64_t first=0;first<int64_t(core.ledger.size());first+=group) {
         int64_t n=std::min(group,int64_t(core.ledger.size())-first);
-        writer.append(n,[&](size_t col,int64_t i)->i64 {const auto& r=core.ledger[first+i];switch(col) {case 0:return first+i;case 1:return r.recv;case 2:return r.send;case 3:return r.latency;case 4:return r.src;case 5:return r.dst;case 6:return r.id;case 7:return r.kind;case 8:return r.order_id;default:return r.parent;}});
+        ledger_block(writer,core.ledger.data()+first,n,first);
     }
     return writer.close();
 }
 void ledger_block(Writer& writer,const std::vector<LedgerRow>& rows,int64_t first) {
-    writer.append(rows.size(),[&](size_t col,int64_t i)->i64 {const auto& r=rows[i];switch(col) {case 0:return first+i;case 1:return r.recv;case 2:return r.send;case 3:return r.latency;case 4:return r.src;case 5:return r.dst;case 6:return r.id;case 7:return r.kind;case 8:return r.order_id;default:return r.parent;}});
+    ledger_block(writer,rows.data(),rows.size(),first);
 }
 }

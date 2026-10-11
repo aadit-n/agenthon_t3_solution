@@ -42,8 +42,10 @@ FROM sources AS cython
 COPY --from=compiler /opt /opt
 
 # The submission path is a standalone C++ process: no Python startup or callbacks.
-FROM toolchain AS cpp-compiler
+FROM toolchain AS cpp-toolchain
 RUN apt-get update && apt-get install -y --no-install-recommends nlohmann-json3-dev libssl-dev
+
+FROM cpp-toolchain AS cpp-compiler
 COPY t3sim/native_types.hpp /opt/t3sim/native_types.hpp
 COPY native /opt/native
 COPY scripts/build_cpp.sh /tmp/build_cpp.sh
@@ -65,11 +67,12 @@ WORKDIR /work
 ENTRYPOINT ["entrypoint"]
 CMD ["--help"]
 
-FROM cpp-compiler AS lite-compiler
+FROM cpp-toolchain AS lite-compiler
 RUN apt-get update && apt-get install -y --no-install-recommends libsnappy-dev=1.2.2-1
-COPY scripts/build_lite.sh scripts/pgo_scenarios.py /tmp/
+COPY native /opt/native
+COPY scripts/build_lite.sh scripts/build_release.sh scripts/pgo_scenarios.py /tmp/
 ARG T3_BUILD_PGO=1
-RUN T3_BUILD_PGO=$T3_BUILD_PGO sh /tmp/build_lite.sh
+RUN T3_BUILD_PGO=$T3_BUILD_PGO sh /tmp/build_release.sh
 
 FROM base AS final
 ENV T3SIM_STREAM_LEDGER=1 T3SIM_STREAM_TRACE=auto T3SIM_LATENCY_PREFETCH=auto

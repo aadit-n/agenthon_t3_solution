@@ -199,7 +199,7 @@ def write_report(report, folder):
     roster = report.get("prior_public_roster")
     if roster:
         declared = roster["arithmetic_mean_self_reported_events_per_sec"]
-        text += [f"The complete {roster['units']}-unit local public pass in `{roster.get('path','saved public results')}` averaged **{declared:,.0f} self-reported events/s** and **{roster['arithmetic_mean_full_container_events_per_sec']:,.0f} full-container events/s**. Its self-reported mean is numerically **{declared/report['leader_score']:.2f}×** the comparison target. Hardware, timing controls and evaluation roster are not certified equivalent; these figures do not predict rank.\n"]
+        text += [f"The complete {roster['units']}-unit local public pass in `{roster.get('path','saved public results')}` averaged **{declared:,.0f} self-reported events/s** and **{roster['arithmetic_mean_full_container_events_per_sec']:,.0f} full-container events/s**. Hardware, timing controls and evaluation roster differ from Codabench; these figures do not predict a score or rank.\n"]
     text += ["An updated official score requires uploading this image and running the organizer's evaluation. Detailed repeats, ranges, CPU usage, memory, event/message/order counts and simulated-time speed are in `performance.json`. Three repeats provide a useful local comparison; they do not establish production tail-latency or reliability SLAs.\n"]
     (folder / "REPORT.md").write_text("\n".join(text) + "\n", encoding="utf8")
 

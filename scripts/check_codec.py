@@ -1,5 +1,8 @@
 """Independent Arrow decoder checks for custom Parquet boundary/overflow cases."""
 import argparse
+import os
+os.environ.setdefault('OPENBLAS_NUM_THREADS','1')
+os.environ.setdefault('OMP_NUM_THREADS','1')
 import hashlib
 import json
 from pathlib import Path

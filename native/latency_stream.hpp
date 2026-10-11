@@ -34,6 +34,11 @@ public:
         }
         return current[position++];
     }
-    void stop() {if(thread.joinable()) {stopping.store(true);ready.notify_all();thread.join();}}
+    void stop() {if(thread.joinable()) {
+        // Serialize the predicate change with wait's unlock-and-sleep step.
+        // An atomic flag alone allows a notification to be lost at shutdown.
+        {std::lock_guard<std::mutex> lock(mutex);stopping.store(true);}
+        ready.notify_all();thread.join();
+    }}
 };
 }

@@ -11,6 +11,7 @@
 !scripts/entrypoint_cpp.sh
 !scripts/build_cpp.sh
 !scripts/build_lite.sh
+!scripts/build_release.sh
 !scripts/pgo_scenarios.py
 !native/
 !native/**

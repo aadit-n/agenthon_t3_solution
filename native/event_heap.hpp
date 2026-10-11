@@ -6,8 +6,7 @@ class EventHeap {
     std::vector<CompactScheduled> heap;
     static bool earlier(const CompactScheduled& a,const CompactScheduled& b) {
         if(a.time!=b.time) return a.time<b.time;
-        if(a.src!=b.src) return a.src<b.src;
-        if(a.dst!=b.dst) return a.dst<b.dst;
+        if(a.routing()!=b.routing()) return a.routing()<b.routing();
         return a.id<b.id;
     }
 public:

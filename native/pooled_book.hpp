@@ -14,17 +14,39 @@ class PooledBook {
     std::vector<uint32_t> by_id,free;
     PriceLevel* best[2]={nullptr,nullptr};
     i64 price[2]={0,0};
+#ifdef T3_PRICE_CACHE
+    struct Cached {i64 price=0;PriceLevel* level=nullptr;};
+    Cached cache[2][256];
+    std::map<i64,PriceLevel>::iterator best_position[2];
+    PriceLevel& level_for(int side,i64 value) {
+        auto& hit=cache[side][uint64_t(value)&255];
+        if(hit.level&&hit.price==value) return *hit.level;
+        auto& level=levels[side][value];hit={value,&level};return level;
+    }
+#endif
     void refresh(int side) {
         if(levels[side].empty()) {best[side]=nullptr;price[side]=0;return;}
         auto it=side==0?std::prev(levels[side].end()):levels[side].begin();
         best[side]=&it->second;price[side]=it->first;
+#ifdef T3_PRICE_CACHE
+        best_position[side]=it;
+#endif
     }
     void remove(uint32_t slot) {
         auto& node=nodes[slot];auto* level=node.level;int side=node.order.side;
         if(node.prev!=NONE) nodes[node.prev].next=node.next;else level->head=node.next;
         if(node.next!=NONE) nodes[node.next].prev=node.prev;else level->tail=node.prev;
         by_id[size_t(node.order.id)]=NONE;node.level=nullptr;free.push_back(slot);
-        if(level->head==NONE) {levels[side].erase(node.order.price);refresh(side);}
+        if(level->head==NONE) {
+#ifdef T3_PRICE_CACHE
+            auto& hit=cache[side][uint64_t(node.order.price)&255];
+            if(hit.level==level) hit.level=nullptr;
+            if(level==best[side]) {levels[side].erase(best_position[side]);refresh(side);}
+            else levels[side].erase(node.order.price);
+#else
+            levels[side].erase(node.order.price);refresh(side);
+#endif
+        }
     }
 public:
     PooledBook() {nodes.reserve(1024);by_id.reserve(4096);free.reserve(1024);}
@@ -41,12 +63,20 @@ public:
         uint32_t slot;
         if(free.empty()) {slot=nodes.size();nodes.emplace_back();}
         else {slot=free.back();free.pop_back();}
-        auto& level=levels[order.side][order.price];auto& node=nodes[slot];
+#ifdef T3_PRICE_CACHE
+        auto& level=level_for(order.side,order.price);
+#else
+        auto& level=levels[order.side][order.price];
+#endif
+        auto& node=nodes[slot];
         node={order,level.tail,NONE,&level};
         if(level.tail!=NONE) nodes[level.tail].next=slot;else level.head=slot;
         level.tail=slot;level.quantity+=order.quantity;by_id[size_t(order.id)]=slot;
         if(!best[order.side]||(order.side==0?order.price>price[0]:order.price<price[1])) {
             best[order.side]=&level;price[order.side]=order.price;
+#ifdef T3_PRICE_CACHE
+            best_position[order.side]=levels[order.side].find(order.price);
+#endif
         }
     }
     Order take(int incoming_side,i64 quantity) {

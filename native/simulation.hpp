@@ -3,6 +3,7 @@
 #include "core.hpp"
 #include "random.hpp"
 #include "latency_stream.hpp"
+#include "action_stream.hpp"
 #include <nlohmann/json.hpp>
 #include <memory>
 #include <string>
@@ -29,15 +30,15 @@ class Oracle {
     Random rng;
     OracleTime previous;
     i64 value,reference;
-    double gamma,theta,rate,shock_mean,shock_time,shock_value;
+    double gamma,theta,rate,shock_mean,shock_time,shock_value,variance_coefficient;
     bool jump_pending=false;
     i64 jump_time=0,jump_value=0;
     i64 compute(OracleTime time,double adjustment) {
         double d=time.minus(previous);
         double loc=reference+(value-reference)*std::exp(-gamma*d);
-        double scale=std::sqrt((std::pow(theta,2)/(2*gamma))*(1-std::exp(-2*gamma*d)));
+        double scale=std::sqrt(variance_coefficient*(1-std::exp(-2*gamma*d)));
         double v=rng.normal(loc,scale)+adjustment;
-        value=i64(std::nearbyint(std::max(0.,v)));
+        value=rounded_integer(std::max(0.,v));
         if (jump_pending && (time.floating?time.real>=double(jump_time):time.integer>=jump_time)) {
             value=std::max<i64>(0,value+jump_value); jump_pending=false;
         }
@@ -54,6 +55,7 @@ public:
         double k=p.value("kappa",0.);gamma=k>0?k/1e9:1.67e-16;
         double r=p.value("jump_intensity",0.);rate=r>0?r/1e9:2.77778e-18;
         theta=p.value("sigma",5e-5);shock_mean=p.value("jump_sigma",0.);
+        variance_coefficient=std::pow(theta,2)/(2*gamma);
         if (!shock_mean) shock_mean=1000;
         if (p.contains("scheduled_jump")&&!p["scheduled_jump"].is_null()&&!p["scheduled_jump"].empty()) {
             const auto& j=p["scheduled_jump"];jump_pending=true;
@@ -74,7 +76,7 @@ public:
     i64 observe(i64 time,Random& observer,double variance) {
         i64 closing=DATE+57600000000000LL;
         i64 v=advance(time>=closing?closing-1:time);
-        return variance?i64(std::nearbyint(observer.normal(double(v),std::sqrt(variance)))):v;
+        return variance?rounded_integer(observer.normal(double(v),std::sqrt(variance))):v;
     }
 };
 
@@ -89,11 +91,24 @@ class Simulation {
     std::vector<double> locations;
     std::vector<i64> exchange_latencies;
     std::unique_ptr<LatencyStream> latency_stream;
+    std::unique_ptr<ActionStream> action_stream;
+    bool action_latency=false;
+    NoiseAction noise_action(int agent) {
+        const auto& a=c.agents[agent];
+        i64 size=std::max<i64>(1,rounded_integer(rngs[agent].normal(a.mean,a.stddev)));
+        int buy=rngs[agent].bounded(2);
+#ifdef T3_PREPARED_RANDOM
+        i64 offset=rngs[agent].bounded_prepared(a.offset,a.offset_mask);
+#else
+        i64 offset=rngs[agent].bounded(a.offset+1);
+#endif
+        return {size,offset,buy};
+    }
     i64 sampled_latency() {
         double v=latency_kind==1?latency_rng.uniform(latency_min,latency_max):
                  latency_kind==2?latency_rng.lognormal(latency_mu,latency_sigma):
                  (latency_min>0?latency_min:1)*(1+latency_rng.pareto(latency_alpha));
-        return i64(std::nearbyint(std::max(latency_min,std::min(latency_max,v))));
+        return rounded_integer(std::max(latency_min,std::min(latency_max,v)));
     }
     i64 latency_for(int sender,int recipient) {
         if (sender==recipient) return 0;
@@ -103,13 +118,13 @@ class Simulation {
             double distance=locations[sender]-locations[recipient];
             return i64(std::sqrt(distance*distance)/0.299792458);
         }
-        return latency_stream?latency_stream->next():sampled_latency();
+        return action_latency?action_stream->next_latency():latency_stream?latency_stream->next():sampled_latency();
     }
     void send(int sender,int recipient,Msg msg) {
         msg.src=sender;msg.dst=recipient;msg.parent=c.causal;
         msg.send=c.now+c.agents[sender].delay;
         if (sender==0&&(msg.kind==ACCEPTED||msg.kind==EXECUTED||msg.kind==CANCELLED)) msg.send+=c.ack_delay;
-        msg.latency=latency_for(sender,recipient);msg.recv=msg.send+msg.latency;c.enqueue(msg);
+        msg.arrive(latency_for(sender,recipient));c.enqueue(msg);
     }
     void simple(int sender,int recipient,int kind) { send(sender,recipient,c.make(kind)); }
     void order_message(int sender,int kind,const Order& order) {
@@ -122,8 +137,8 @@ class Simulation {
     void act(int agent,i64 bid,i64 ask) {
         auto& a=c.agents[agent];
         if (a.type==1) {
-            i64 size=std::max<i64>(1,i64(std::nearbyint(rngs[agent].normal(a.mean,a.stddev))));
-            int buy=rngs[agent].bounded(2);i64 offset=rngs[agent].bounded(a.offset+1);
+            NoiseAction action=action_stream?action_stream->next_noise(agent):noise_action(agent);
+            i64 size=action.size,offset=action.offset;int buy=action.buy;
             i64 anchor=buy?(ask?ask:(bid?bid:a.reference)):(bid?bid:(ask?ask:a.reference));
             place(agent,size,buy?0:1,buy?anchor+offset:anchor-offset);
         } else if (a.type==2) {
@@ -135,7 +150,7 @@ class Simulation {
         } else {
             if (!bid&&!ask) return;
             double mid=bid&&ask?(double(bid)+double(ask))/2:double(bid?bid:ask);
-            i64 size=std::max<i64>(1,i64(std::nearbyint(a.mean)));
+            i64 size=std::max<i64>(1,rounded_integer(a.mean));
             if (a.type==3) {
                 i64 fundamental=oracle.observe(c.now,rngs[agent],a.sigma_n);
                 if (mid<fundamental-a.threshold&&ask) place(agent,size,0,ask);
@@ -174,8 +189,8 @@ class Simulation {
         case HOURS_REQ:c.agents[0].delay=0;simple(0,msg.src,HOURS);break;
         case CLOSE_REQ:c.subscriptions.push_back(msg.src);break;
         case QUERY: {
-            Msg response=c.make(SPREAD);response.bid=c.book.best_price(0);response.ask=c.book.best_price(1);
-            response.closed=c.now>c.close;send(0,msg.src,response);break;
+            Msg response=c.make(SPREAD);response.spread(c.book.best_price(0),c.book.best_price(1),c.now>c.close);
+            send(0,msg.src,response);break;
         }
         case LIMIT:limit(msg.order);break;
         case CANCEL: { Order o=c.book.cancel(msg.order);if (o.id>=0) order_message(0,CANCELLED,o);break; }
@@ -192,8 +207,8 @@ class Simulation {
         case ACCEPTED:c.log(msg.dst,ACCEPT,msg.order);break;
         case CANCELLED:c.log(msg.dst,CANCEL_EVENT,msg.order);c.cancelled(msg.dst,msg.order.id);break;
         case SPREAD:
-            if (msg.closed) a.closed=true;
-            if (a.awaiting) { if (!a.closed) act(msg.dst,msg.bid,msg.ask);a.awaiting=false; } break;
+            if (msg.spread_closed()) a.closed=true;
+            if (a.awaiting) { if (!a.closed) act(msg.dst,msg.spread_bid(),msg.spread_ask());a.awaiting=false; } break;
         case CLOSE_PRICE:break;
         default:throw std::runtime_error("unexpected agent message");
         }
@@ -222,6 +237,7 @@ public:
             if (kind=="NoiseTrader") {
                 a.type=1;a.mean=p.value("order_size_mean",10.);a.stddev=p.value("order_size_std",2.);a.offset=p.value("price_offset_ticks",i64(5));
                 if (a.stddev<0||a.offset<0) throw std::invalid_argument("negative noise scale/offset");
+                a.offset_mask=Random::mask_for(a.offset);
             } else if (kind=="MarketMaker") {
                 a.type=2;a.spread=std::max(2,p.value("spread_ticks",2));a.depth=std::max(1,p.value("depth_levels",3));a.size=std::max<i64>(1,p.value("size_per_level",i64(10)));
             } else if (kind=="ValueTrader") { a.type=3;a.mean=p.value("order_size_mean",25.);a.threshold=p.value("threshold_ticks",i64(2));a.sigma_n=1000; }
@@ -249,7 +265,7 @@ public:
             latency_kind=model=="uniform"?1:model=="log_normal"?2:model=="pareto"?3:4;
             double mean=p.value("mean_ns",0.);latency_mu=mean>0?std::log(mean):0;
             latency_sigma=p.value("sigma",0.);latency_min=p.value("min_ns",0.);latency_max=p.value("max_ns",1e12);latency_alpha=p.value("alpha",1.5);
-            fixed_latency=i64(std::nearbyint(std::max(latency_min,std::min(latency_max,mean))));
+            fixed_latency=rounded_integer(std::max(latency_min,std::min(latency_max,mean)));
         } else {
             latency_kind=0;locations.reserve(c.agents.size());
             for (size_t i=0;i<c.agents.size();++i) locations.push_back(latency_rng.uniform(0,3866660));
@@ -257,18 +273,30 @@ public:
             for(double position:locations) {double distance=locations[0]-position;exchange_latencies.push_back(i64(std::sqrt(distance*distance)/0.299792458));}
         }
         global.word(); // The otherwise unused kernel RandomState seed.
+        const char* noise_prefetch=std::getenv("T3SIM_NOISE_PREFETCH");
+        long double noise_workload=0;std::vector<int> noise_ids;
+        for(size_t i=1;i<c.agents.size();++i) if(c.agents[i].type==1) {noise_workload+=1+static_cast<long double>(c.close-c.open)/c.agents[i].interval;noise_ids.push_back(int(i));}
+        bool prepare_noise=parallel_latency&&noise_prefetch&&std::strcmp(noise_prefetch,"off")!=0&&!noise_ids.empty()&&(std::strcmp(noise_prefetch,"auto")!=0||noise_workload>=65536);
         const char* prefetch=std::getenv("T3SIM_LATENCY_PREFETCH");
         if(parallel_latency&&prefetch&&std::strcmp(prefetch,"off")!=0&&latency_kind>=1&&latency_kind<=3) {
             long double workload=0;
             for(size_t i=1;i<c.agents.size();++i) {const auto& a=c.agents[i];workload+=(1+static_cast<long double>(c.close-c.open)/a.interval)*(a.type==2?8*a.depth+6:8);}
-            if(std::strcmp(prefetch,"auto")!=0||workload>=32768) latency_stream=std::make_unique<LatencyStream>([this]{return sampled_latency();});
+            action_latency=std::strcmp(prefetch,"auto")!=0||workload>=32768;
         }
+        if(prepare_noise) action_stream=std::make_unique<ActionStream>(c.agents.size(),noise_ids,[this](int agent){return noise_action(agent);},action_latency?std::function<i64()>([this]{return sampled_latency();}):std::function<i64()>());
+        else if(action_latency) {action_latency=false;latency_stream=std::make_unique<LatencyStream>([this]{return sampled_latency();});}
     }
-    void stop_latency() {latency_stream.reset();}
+    ~Simulation() {stop_latency();}
+    void stop_latency() {action_stream.reset();latency_stream.reset();}
     void run() {
         c.wake(0,c.close);for (size_t i=0;i<c.agents.size();++i) c.wake(i,c.now);
         while (!c.empty()&&c.now&&c.now<=c.stop) {
-            Msg msg=c.pop();auto& a=c.agents[msg.dst];
+#ifdef T3_REF_MESSAGES
+            Msg& msg=c.pop();
+#else
+            Msg msg=c.pop();
+#endif
+            auto& a=c.agents[msg.dst];
             if (a.time>c.now) { c.postpone(msg,a.time);continue; }
             a.time=c.now;c.causal=msg.id;
             if (msg.kind==WAKE) {
@@ -282,6 +310,7 @@ public:
                 }
                 a.time+=a.delay;
             } else { a.time+=a.delay;c.delivered(msg);if (msg.dst==0) exchange(msg);else receive(msg); }
+            c.recipient_ready(msg.dst,a.time);
         }
     }
 };

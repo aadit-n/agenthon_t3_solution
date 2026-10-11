@@ -68,10 +68,26 @@ struct Order {
     int agent=0, side=0;
 };
 struct Msg {
+#ifdef T3_COMPACT_MESSAGES
+    i64 id=0, send=-1, recv=0, parent=-1;
+    int src=0, dst=0, kind=0;
+    Order order;
+    i64 delivery_latency() const {return kind==WAKE?0:recv-send;}
+    void arrive(i64 latency) {recv=send+latency;}
+    void spread(i64 bid,i64 ask,bool closed) {order.price=bid;order.quantity=ask;order.fill_price=closed;}
+    i64 spread_bid() const {return order.price;} i64 spread_ask() const {return order.quantity;}
+    bool spread_closed() const {return order.fill_price!=0;}
+#else
     i64 id=0, send=-1, recv=0, latency=0, parent=-1, bid=0, ask=0;
     int src=0, dst=0, kind=0;
     bool closed=false;
     Order order;
+    i64 delivery_latency() const {return latency;}
+    void arrive(i64 value) {latency=value;recv=send+value;}
+    void spread(i64 b,i64 a,bool c) {bid=b;ask=a;closed=c;}
+    i64 spread_bid() const {return bid;} i64 spread_ask() const {return ask;}
+    bool spread_closed() const {return closed;}
+#endif
 };
 struct Scheduled {
     i64 time;
@@ -83,11 +99,48 @@ struct Scheduled {
 };
 #ifdef T3_STANDALONE
 struct CompactScheduled {
-    i64 time,id;
+    i64 time=0,id=0;
+#ifdef T3_PACKED_ROUTE
+    uint64_t route=0;
+#else
     int src,dst;
-    uint32_t slot;
+#endif
+    uint32_t slot=0;
+    CompactScheduled()=default;
+    CompactScheduled(i64 t,i64 message,int sender,int recipient,uint32_t s):time(t),id(message),slot(s) {
+#ifdef T3_PACKED_ROUTE
+        route=(uint64_t(uint32_t(sender)^0x80000000U)<<32)|(uint32_t(recipient)^0x80000000U);
+#else
+        src=sender;dst=recipient;
+#endif
+    }
+    uint64_t routing() const {
+#ifdef T3_PACKED_ROUTE
+        return route;
+#else
+        return (uint64_t(uint32_t(src)^0x80000000U)<<32)|(uint32_t(dst)^0x80000000U);
+#endif
+    }
+    int source() const {
+#ifdef T3_PACKED_ROUTE
+        return int32_t(uint32_t(route>>32)^0x80000000U);
+#else
+        return src;
+#endif
+    }
+    int recipient() const {
+#ifdef T3_PACKED_ROUTE
+        return int32_t(uint32_t(route)^0x80000000U);
+#else
+        return dst;
+#endif
+    }
     bool operator<(const CompactScheduled& other) const {
+#ifdef T3_PACKED_ROUTE
+        return std::tie(time,route,id)>std::tie(other.time,other.route,other.id);
+#else
         return std::tie(time,src,dst,id)>std::tie(other.time,other.src,other.dst,other.id);
+#endif
     }
 };
 #endif
@@ -99,12 +152,20 @@ struct LedgerRow {
     i64 id, send, recv, latency, parent, order_id;
     int src, dst, kind;
 };
+}
+#include "open_orders.hpp"
+namespace t3 {
 struct AgentState {
     i64 time=0, delay=50, interval=0, reference=0, size=0, threshold=0, offset=0;
     int type=0, depth=0, spread=0, lookback=0;
     double mean=0, stddev=0, sigma_n=0;
+    uint64_t offset_mask=0;
     bool first=true, hours=false, closed=false, awaiting=false, log_orders=true;
+#ifdef T3_FLAT_OPEN
+    FlatOpenOrders open;
+#else
     std::map<i64,Order> open;
+#endif
     std::vector<double> mids;
 };
 struct Level { std::list<i64> fifo; i64 quantity=0; };
@@ -172,6 +233,9 @@ public:
 }
 #include "pooled_book.hpp"
 #include "event_heap.hpp"
+#include "radix_queue.hpp"
+#include "recipient_queue.hpp"
+#include "message_pool.hpp"
 namespace t3 {
 #ifdef T3_POOL_BOOK
 using Book=PooledBook;
@@ -181,12 +245,21 @@ using Book=LegacyBook;
 class Core {
 public:
 #ifdef T3_STANDALONE
-#ifdef T3_FOUR_HEAP
+#ifdef T3_RECIPIENT_QUEUE
+    RecipientQueue queue;
+#elif defined(T3_RADIX_QUEUE)
+    RadixQueue queue;
+#elif defined(T3_FOUR_HEAP)
     EventHeap queue;
 #else
     std::priority_queue<CompactScheduled> queue;
 #endif
+#ifdef T3_REF_MESSAGES
+    MessagePool messages;
+    uint32_t held_message=UINT32_MAX;
+#else
     std::vector<Msg> messages;
+#endif
     std::vector<uint32_t> free_slots;
     bool track_all_orders=false;
 #else
@@ -221,7 +294,7 @@ public:
     }
     void enqueue(const Msg& m) { postpone(m,m.recv); }
     void delivered(const Msg& m) {
-        ledger.push_back(LedgerRow{m.id,m.send,m.recv,m.latency,m.parent,m.order.id,m.src,m.dst,m.kind});
+        ledger.push_back(LedgerRow{m.id,m.send,m.recv,m.delivery_latency(),m.parent,m.order.id,m.src,m.dst,m.kind});
         ++total_messages;
         if(ledger_sink&&ledger.size()==65536) {
             ledger_sink(std::move(ledger));ledger=std::vector<LedgerRow>();ledger.reserve(65536);
@@ -234,18 +307,39 @@ public:
             trace=std::vector<TraceRow>();trace.reserve(16384);
         }
     }
+#ifdef T3_REF_MESSAGES
+    Msg& pop() {
+#else
     Msg pop() {
+#endif
 #ifdef T3_STANDALONE
+#ifdef T3_RECIPIENT_QUEUE
+        queue.before_pop(stop);
+#endif
         CompactScheduled s=queue.top();queue.pop();trace_boundary(s.time);now=s.time;
+#ifdef T3_REF_MESSAGES
+        if(held_message!=UINT32_MAX) free_slots.push_back(held_message);
+        held_message=s.slot;return messages[s.slot];
+#else
         Msg m=messages[s.slot];free_slots.push_back(s.slot);return m;
+#endif
 #else
         Scheduled s=queue.top(); queue.pop(); now=s.time;
         return s.msg;
 #endif
     }
+    void recipient_ready(int agent,i64 time) {
+#ifdef T3_RECIPIENT_QUEUE
+        queue.ready(agent,time);
+#endif
+    }
     void postpone(const Msg& m, i64 time) {
 #ifdef T3_STANDALONE
         uint32_t slot;
+#ifdef T3_REF_MESSAGES
+        if(held_message!=UINT32_MAX && &m==&messages[held_message]) {slot=held_message;held_message=UINT32_MAX;}
+        else
+#endif
         if (free_slots.empty()) { slot=messages.size();messages.push_back(m); }
         else { slot=free_slots.back();free_slots.pop_back();messages[slot]=m; }
         queue.push(CompactScheduled{time,m.id,m.src,m.dst,slot});
@@ -277,6 +371,9 @@ public:
         return result;
     }
     void executed(int agent, const Order& o) {
+#ifdef T3_STANDALONE
+        if(!track_all_orders&&agents[agent].type!=2) return;
+#endif
         auto& orders=agents[agent].open;
         auto it=orders.find(o.id);
         if (it!=orders.end()) {
@@ -293,7 +390,7 @@ public:
 #endif
         agents[agent].open.emplace(o.id,o);
     }
-    void finish() {
+    void finish(bool finalize_types=true) {
 #ifdef T3_STANDALONE
         const char* option=std::getenv("T3SIM_FULL_SORT");
         bool full=option&&std::strcmp(option,"1")==0;
@@ -311,6 +408,7 @@ public:
                 first=last;
             }
         }
+        if(!finalize_types) return;
         std::vector<uint8_t> seen(size_t(next_order),0);
         for (auto it=trace.rbegin();it!=trace.rend();++it) if (it->kind==EXEC) {
             it->kind=seen[size_t(it->order_id)]?PARTIAL:FILL;seen[size_t(it->order_id)]=1;
