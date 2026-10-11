@@ -7,7 +7,7 @@ namespace t3 {
 // an artificial price window. Live allocations are per level, never per order.
 class PooledBook {
     static constexpr uint32_t NONE=UINT32_MAX;
-    struct PriceLevel {uint32_t head=NONE,tail=NONE;i64 quantity=0;};
+    struct PriceLevel {uint32_t head=NONE,tail=NONE;i64 quantity=0;std::map<i64,PriceLevel>::iterator it;};
     struct Node {Order order;uint32_t prev=NONE,next=NONE;PriceLevel* level=nullptr;};
     std::map<i64,PriceLevel> levels[2];
     std::vector<Node> nodes;
@@ -16,21 +16,19 @@ class PooledBook {
     i64 price[2]={0,0};
 #ifdef T3_PRICE_CACHE
     struct Cached {i64 price=0;PriceLevel* level=nullptr;};
-    Cached cache[2][256];
-    std::map<i64,PriceLevel>::iterator best_position[2];
+    Cached cache[2][1024];
     PriceLevel& level_for(int side,i64 value) {
-        auto& hit=cache[side][uint64_t(value)&255];
+        auto& hit=cache[side][uint64_t(value)&1023];
         if(hit.level&&hit.price==value) return *hit.level;
-        auto& level=levels[side][value];hit={value,&level};return level;
+        auto [pos,inserted]=levels[side].try_emplace(value);
+        if(inserted) pos->second.it=pos;
+        hit={value,&pos->second};return pos->second;
     }
 #endif
     void refresh(int side) {
         if(levels[side].empty()) {best[side]=nullptr;price[side]=0;return;}
         auto it=side==0?std::prev(levels[side].end()):levels[side].begin();
         best[side]=&it->second;price[side]=it->first;
-#ifdef T3_PRICE_CACHE
-        best_position[side]=it;
-#endif
     }
     void remove(uint32_t slot) {
         auto& node=nodes[slot];auto* level=node.level;int side=node.order.side;
@@ -39,10 +37,11 @@ class PooledBook {
         by_id[size_t(node.order.id)]=NONE;node.level=nullptr;free.push_back(slot);
         if(level->head==NONE) {
 #ifdef T3_PRICE_CACHE
-            auto& hit=cache[side][uint64_t(node.order.price)&255];
+            auto& hit=cache[side][uint64_t(node.order.price)&1023];
             if(hit.level==level) hit.level=nullptr;
-            if(level==best[side]) {levels[side].erase(best_position[side]);refresh(side);}
-            else levels[side].erase(node.order.price);
+            bool was_best=(level==best[side]);
+            levels[side].erase(level->it);
+            if(was_best) refresh(side);
 #else
             levels[side].erase(node.order.price);refresh(side);
 #endif
@@ -66,7 +65,9 @@ public:
 #ifdef T3_PRICE_CACHE
         auto& level=level_for(order.side,order.price);
 #else
-        auto& level=levels[order.side][order.price];
+        auto [pos,inserted]=levels[order.side].try_emplace(order.price);
+        if(inserted) pos->second.it=pos;
+        auto& level=pos->second;
 #endif
         auto& node=nodes[slot];
         node={order,level.tail,NONE,&level};
@@ -74,9 +75,6 @@ public:
         level.tail=slot;level.quantity+=order.quantity;by_id[size_t(order.id)]=slot;
         if(!best[order.side]||(order.side==0?order.price>price[0]:order.price<price[1])) {
             best[order.side]=&level;price[order.side]=order.price;
-#ifdef T3_PRICE_CACHE
-            best_position[order.side]=levels[order.side].find(order.price);
-#endif
         }
     }
     Order take(int incoming_side,i64 quantity) {

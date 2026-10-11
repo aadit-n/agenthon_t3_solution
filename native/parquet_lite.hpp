@@ -200,6 +200,12 @@ struct Field {std::string name;int physical;bool nullable=false,categorical=fals
 struct Chunk {int physical,encoding;int64_t n,data_offset=0,dict_offset=-1,compressed=0,uncompressed=0;};
 struct Group {int64_t n,bytes=0,compressed=0;std::vector<Chunk> columns;};
 std::string pandas(const std::vector<Field>& fields) {
+    if(!fields.empty()&&fields[0].name=="t_ns") {
+        return "{\"column_indexes\":[],\"columns\":[{\"field_name\":\"t_ns\",\"metadata\":null,\"name\":\"t_ns\",\"numpy_type\":\"int64\",\"pandas_type\":\"int64\"},{\"field_name\":\"agent_id\",\"metadata\":null,\"name\":\"agent_id\",\"numpy_type\":\"int32\",\"pandas_type\":\"int32\"},{\"field_name\":\"msg_type\",\"metadata\":null,\"name\":\"msg_type\",\"numpy_type\":\"string\",\"pandas_type\":\"unicode\"},{\"field_name\":\"side\",\"metadata\":null,\"name\":\"side\",\"numpy_type\":\"string\",\"pandas_type\":\"unicode\"},{\"field_name\":\"price\",\"metadata\":null,\"name\":\"price\",\"numpy_type\":\"int64\",\"pandas_type\":\"int64\"},{\"field_name\":\"size\",\"metadata\":null,\"name\":\"size\",\"numpy_type\":\"int64\",\"pandas_type\":\"int64\"},{\"field_name\":\"order_id\",\"metadata\":null,\"name\":\"order_id\",\"numpy_type\":\"int64\",\"pandas_type\":\"int64\"}],\"creator\":{\"library\":\"agenthon-t3\",\"version\":\"4.0\"},\"index_columns\":[],\"pandas_version\":\"1.5.3\"}";
+    }
+    if(!fields.empty()&&fields[0].name=="seq") {
+        return "{\"column_indexes\":[],\"columns\":[{\"field_name\":\"seq\",\"metadata\":null,\"name\":\"seq\",\"numpy_type\":\"int64\",\"pandas_type\":\"int64\"},{\"field_name\":\"t_recv_ns\",\"metadata\":null,\"name\":\"t_recv_ns\",\"numpy_type\":\"int64\",\"pandas_type\":\"int64\"},{\"field_name\":\"t_send_ns\",\"metadata\":null,\"name\":\"t_send_ns\",\"numpy_type\":\"Int64\",\"pandas_type\":\"int64\"},{\"field_name\":\"latency_ns\",\"metadata\":null,\"name\":\"latency_ns\",\"numpy_type\":\"int64\",\"pandas_type\":\"int64\"},{\"field_name\":\"src_id\",\"metadata\":null,\"name\":\"src_id\",\"numpy_type\":\"int32\",\"pandas_type\":\"int32\"},{\"field_name\":\"dst_id\",\"metadata\":null,\"name\":\"dst_id\",\"numpy_type\":\"int32\",\"pandas_type\":\"int32\"},{\"field_name\":\"message_id\",\"metadata\":null,\"name\":\"message_id\",\"numpy_type\":\"int64\",\"pandas_type\":\"int64\"},{\"field_name\":\"msg_type\",\"metadata\":null,\"name\":\"msg_type\",\"numpy_type\":\"string\",\"pandas_type\":\"unicode\"},{\"field_name\":\"order_id\",\"metadata\":null,\"name\":\"order_id\",\"numpy_type\":\"Int64\",\"pandas_type\":\"int64\"},{\"field_name\":\"causal_parent\",\"metadata\":null,\"name\":\"causal_parent\",\"numpy_type\":\"Int64\",\"pandas_type\":\"int64\"}],\"creator\":{\"library\":\"agenthon-t3\",\"version\":\"4.0\"},\"index_columns\":[],\"pandas_version\":\"1.5.3\"}";
+    }
     Json columns=Json::array();
     for(const auto& f:fields) {
         bool string=f.physical==6;std::string type=string?"unicode":f.physical==1?"int32":"int64";
@@ -334,17 +340,24 @@ public:
         }
         groups.push_back(std::move(group));rows+=n;
     }
+    void append_ledger(const LedgerRow* input,int64_t n,int64_t first) {
+        if(n<=0) return;Group group{n};group.columns.reserve(10);
+        {Chunk c{fields[0].physical,5,n};numeric<int64_t>(c,fields[0],0,n,[&](int64_t i){return first+i;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
+        {Chunk c{fields[1].physical,5,n};numeric<int64_t>(c,fields[1],0,n,[&](int64_t i){return input[i].recv;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
+        {Chunk c{fields[2].physical,5,n};numeric<int64_t>(c,fields[2],0,n,[&](int64_t i){return input[i].send;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
+        {Chunk c{fields[3].physical,5,n};numeric<int64_t>(c,fields[3],0,n,[&](int64_t i){return input[i].latency;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
+        {Chunk c{fields[4].physical,5,n};numeric<int32_t>(c,fields[4],0,n,[&](int64_t i){return input[i].src;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
+        {Chunk c{fields[5].physical,5,n};numeric<int32_t>(c,fields[5],0,n,[&](int64_t i){return input[i].dst;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
+        {Chunk c{fields[6].physical,5,n};numeric<int64_t>(c,fields[6],0,n,[&](int64_t i){return input[i].id;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
+        {Chunk c{fields[7].physical,5,n};strings(c,fields[7],0,n,[&](int64_t i){return input[i].kind;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
+        {Chunk c{fields[8].physical,5,n};numeric<int64_t>(c,fields[8],0,n,[&](int64_t i){return input[i].order_id;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
+        {Chunk c{fields[9].physical,5,n};numeric<int64_t>(c,fields[9],0,n,[&](int64_t i){return input[i].parent;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
+        groups.push_back(std::move(group));rows+=n;
+    }
     void append_trace(const std::vector<TraceRow>& trace,int64_t first,int64_t n) {
-        if(n<=0) return;deferred_types=true;Group group{n};group.columns.reserve(fields.size());
-#ifdef T3_COLUMNAR_WRITER
-        std::unique_ptr<i64[]> columns(new i64[size_t(n)*7]);
-#endif
+        if(n<=0) return;deferred_types=true;Group group{n};group.columns.reserve(7);
         for(int64_t i=0;i<n;++i) {
             const auto& row=trace[first+i];int kind=row.kind;
-#ifdef T3_COLUMNAR_WRITER
-            columns[i]=row.time;columns[n+i]=row.agent;columns[3*n+i]=row.side;
-            columns[4*n+i]=row.price;columns[5*n+i]=row.size;columns[6*n+i]=row.order_id;
-#endif
             if(kind==EXEC) {
                 if(row.order_id<0) throw std::runtime_error("execution has no order ID");
                 if(size_t(row.order_id)>=last_execution.size()) last_execution.resize(size_t(row.order_id)+1,SIZE_MAX);
@@ -353,20 +366,13 @@ public:
             }
             type_codes.push_back(uint8_t(kind));
         }
-        for(size_t col=0;col<fields.size();++col) {
-            const auto& field=fields[col];Chunk chunk{field.physical,8,n};
-#ifdef T3_COLUMNAR_WRITER
-            const i64* column=columns.get()+col*n;auto value=[&](int64_t i)->i64 {return column[i];};
-#else
-            auto value=[&](int64_t i)->i64 {const auto& r=trace[first+i];switch(col) {case 0:return r.time;case 1:return r.agent;case 3:return r.side;case 4:return r.price;case 5:return r.size;default:return r.order_id;}};
-#endif
-            if(col!=2) {
-                if(field.physical==6) strings(chunk,field,0,n,value);
-                else if(field.physical==1) numeric<int32_t>(chunk,field,0,n,value);
-                else numeric<int64_t>(chunk,field,0,n,value);
-            }
-            group.bytes+=chunk.uncompressed;group.compressed+=chunk.compressed;group.columns.push_back(chunk);
-        }
+        {Chunk c{fields[0].physical,8,n};numeric<int64_t>(c,fields[0],0,n,[&](int64_t i){return trace[first+i].time;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
+        {Chunk c{fields[1].physical,8,n};numeric<int32_t>(c,fields[1],0,n,[&](int64_t i){return trace[first+i].agent;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
+        {Chunk c{fields[2].physical,8,n};group.columns.push_back(c);}
+        {Chunk c{fields[3].physical,8,n};strings(c,fields[3],0,n,[&](int64_t i){return trace[first+i].side;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
+        {Chunk c{fields[4].physical,8,n};numeric<int64_t>(c,fields[4],0,n,[&](int64_t i){return trace[first+i].price;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
+        {Chunk c{fields[5].physical,8,n};numeric<int64_t>(c,fields[5],0,n,[&](int64_t i){return trace[first+i].size;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
+        {Chunk c{fields[6].physical,8,n};numeric<int64_t>(c,fields[6],0,n,[&](int64_t i){return trace[first+i].order_id;});group.bytes+=c.uncompressed;group.compressed+=c.compressed;group.columns.push_back(c);}
         groups.push_back(std::move(group));rows+=n;
     }
     std::string close() {
@@ -400,17 +406,7 @@ std::string trace(const Core& core,const fs::path& path) {
 }
 void ledger_block(Writer& writer,const LedgerRow* input,int64_t n,int64_t first) {
     if(n<=0) return;
-#ifdef T3_COLUMNAR_WRITER
-    std::unique_ptr<i64[]> columns(new i64[size_t(n)*10]);
-    for(int64_t i=0;i<n;++i) {
-        const auto& row=input[i];columns[i]=first+i;columns[n+i]=row.recv;columns[2*n+i]=row.send;
-        columns[3*n+i]=row.latency;columns[4*n+i]=row.src;columns[5*n+i]=row.dst;
-        columns[6*n+i]=row.id;columns[7*n+i]=row.kind;columns[8*n+i]=row.order_id;columns[9*n+i]=row.parent;
-    }
-    writer.append(n,[&](size_t col,int64_t i)->i64 {return columns[col*n+i];});
-#else
-    writer.append(n,[&](size_t col,int64_t i)->i64 {const auto& r=input[i];switch(col) {case 0:return first+i;case 1:return r.recv;case 2:return r.send;case 3:return r.latency;case 4:return r.src;case 5:return r.dst;case 6:return r.id;case 7:return r.kind;case 8:return r.order_id;default:return r.parent;}});
-#endif
+    writer.append_ledger(input,n,first);
 }
 std::string ledger(const Core& core,const fs::path& path) {
     Writer writer(path,ledger_schema());int64_t group=65536;

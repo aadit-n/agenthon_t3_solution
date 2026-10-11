@@ -307,6 +307,22 @@ public:
             trace=std::vector<TraceRow>();trace.reserve(16384);
         }
     }
+#ifdef T3_STANDALONE
+    const CompactScheduled& top_scheduled() {
+#ifdef T3_RECIPIENT_QUEUE
+        queue.before_pop(stop);
+#endif
+        return queue.top();
+    }
+    void postpone_top(i64 new_time) {
+        CompactScheduled s=queue.top();
+        queue.pop();
+        trace_boundary(s.time);
+        now=s.time;
+        s.time=new_time;
+        queue.push(s);
+    }
+#endif
 #ifdef T3_REF_MESSAGES
     Msg& pop() {
 #else

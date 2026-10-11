@@ -75,7 +75,7 @@ ARG T3_BUILD_PGO=1
 RUN T3_BUILD_PGO=$T3_BUILD_PGO sh /tmp/build_release.sh
 
 FROM base AS final
-ENV T3SIM_STREAM_LEDGER=1 T3SIM_STREAM_TRACE=auto T3SIM_LATENCY_PREFETCH=auto
+ENV T3SIM_STREAM_LEDGER=0 T3SIM_STREAM_TRACE=auto T3SIM_LATENCY_PREFETCH=auto
 COPY --from=lite-compiler /opt/t3sim-cpp /opt/t3sim-cpp
 COPY --from=lite-compiler /usr/lib/x86_64-linux-gnu/libsnappy.so.1.2.2 /usr/lib/x86_64-linux-gnu/libsnappy.so.1
 COPY --from=lite-compiler /usr/share/doc/libsnappy1v5/copyright /opt/licenses/snappy/copyright

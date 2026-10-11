@@ -291,6 +291,10 @@ public:
     void run() {
         c.wake(0,c.close);for (size_t i=0;i<c.agents.size();++i) c.wake(i,c.now);
         while (!c.empty()&&c.now&&c.now<=c.stop) {
+#ifdef T3_STANDALONE
+            const auto& s=c.top_scheduled();
+            if (c.agents[s.recipient()].time>s.time) { c.postpone_top(c.agents[s.recipient()].time);continue; }
+#endif
 #ifdef T3_REF_MESSAGES
             Msg& msg=c.pop();
 #else

@@ -16,8 +16,31 @@ using namespace t3;
 using Clock=std::chrono::steady_clock;using Time=Clock::time_point;
 double seconds(Time since) {return std::chrono::duration<double>(Clock::now()-since).count();}
 std::string env(const char* name,const char* fallback) {const char* value=std::getenv(name);return value?value:fallback;}
-Json read_json(const fs::path& path) {std::ifstream file(path);if(!file) throw std::runtime_error("cannot read "+path.string());Json j;file>>j;return j;}
-void write_json(const fs::path& path,const Json& value) {std::ofstream file(path);file<<value.dump(2)<<'\n';if(!file) throw std::runtime_error("cannot write "+path.string());}
+std::string read_file_string(const fs::path& path) {
+    std::FILE* f=std::fopen(path.c_str(),"rb");
+    if(!f) throw std::runtime_error("cannot read "+path.string());
+    std::fseek(f,0,SEEK_END);
+    long size=std::ftell(f);
+    std::fseek(f,0,SEEK_SET);
+    std::string content(size>0?size:0,'\0');
+    if(size>0) {
+        size_t n=std::fread(content.data(),1,size,f);
+        content.resize(n);
+    }
+    std::fclose(f);
+    return content;
+}
+Json read_json(const fs::path& path) {
+    std::string s=read_file_string(path);
+    return Json::parse(s);
+}
+void write_json(const fs::path& path,const Json& value) {
+    std::string s=value.dump(2)+'\n';
+    std::FILE* f=std::fopen(path.c_str(),"wb");
+    if(!f) throw std::runtime_error("cannot write "+path.string());
+    if(std::fwrite(s.data(),1,s.size(),f)!=s.size()) {std::fclose(f);throw std::runtime_error("cannot write "+path.string());}
+    std::fclose(f);
+}
 int64_t peak_memory() {rusage usage{};getrusage(RUSAGE_SELF,&usage);return int64_t(usage.ru_maxrss)*1024;}
 #include "parquet_lite.hpp"
 template<class Row,bool TRACE=false> class FileStream {
@@ -66,8 +89,8 @@ Json simulate(const fs::path& config,const fs::path& out,std::optional<uint32_t>
     fs::path parent=out.parent_path();if(parent.empty()) parent=".";fs::create_directories(parent);
     long double expected_trace=0;
     for(size_t i=1;i<simulation.c.agents.size();++i) {const auto& a=simulation.c.agents[i];expected_trace+=(1+static_cast<long double>(simulation.c.close-simulation.c.open)/a.interval)*(a.type==2?8*a.depth:6);}
-    std::string trace_mode=env("T3SIM_STREAM_TRACE","0");
-    if(concurrent&&(trace_mode=="1"||(trace_mode=="auto"&&expected_trace>=262144))) {
+    std::string trace_mode=env("T3SIM_STREAM_TRACE","auto");
+    if(concurrent&&(trace_mode=="1"||(trace_mode=="auto"&&expected_trace>=131072))) {
         LedgerStream messages(parent/"message_trace.parquet");TraceStream trace(out);
         simulation.c.ledger_sink=[&](std::vector<LedgerRow>&& rows){messages.submit(std::move(rows));};
         simulation.c.trace_sink=[&](std::vector<TraceRow>&& rows){trace.submit(std::move(rows));};
@@ -84,7 +107,7 @@ Json simulate(const fs::path& config,const fs::path& out,std::optional<uint32_t>
             {"output_write_sec",output_sec},{"trace_encoding_sec",th.second},{"ledger_encoding_sec",mh.second},{"streamed_trace",true}};
         write_json(parent/"events.json",result);return result;
     }
-    if(concurrent&&env("T3SIM_STREAM_LEDGER","0")=="1") {
+    if(concurrent&&env("T3SIM_STREAM_LEDGER","0")=="1"&&expected_trace>=131072) {
         LedgerStream messages(parent/"message_trace.parquet");simulation.c.ledger_sink=[&](std::vector<LedgerRow>&& rows){messages.submit(std::move(rows));};
         std::vector<LedgerRow>().swap(simulation.c.ledger);simulation.c.ledger.reserve(65536);
         double config_sec=seconds(start);Time phase=Clock::now();simulation.run();simulation.stop_latency();double loop_sec=seconds(phase);
