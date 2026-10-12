@@ -9,10 +9,10 @@
   "image": {
     "registry": "ghcr.io",
     "repository": "vvadithya/my-fast-sim",
-    "digest": "sha256:300907520ead048a630de260e9bbdbe2f65dca7c2e3705611a8affe8a85b2a90"
+    "digest": "sha256:f5cd6e10ee4f6b82edaa7fac6b0b19b289a605745902abf01c5ecfe2d4952852"
   },
   "image_access": "public",
   "models": [],
   "license": "MIT",
-  "descriptor_digest": "sha256:03f2be98054d3a932dec43ed58c5c4b8fd1d0943ef763ae22cf5f69202e8c368"
+  "descriptor_digest": "sha256:5db06390d4752dd5a604f5fa6d1bcea5082d1d2a469b9a649a900a35985aa608"
 }
