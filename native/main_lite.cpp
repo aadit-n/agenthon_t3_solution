@@ -12,6 +12,7 @@
 #include <sys/resource.h>
 #include <condition_variable>
 #include <deque>
+#include <unistd.h>
 namespace fs=std::filesystem;
 using namespace t3;
 using OutJson=nlohmann::json;
@@ -106,12 +107,12 @@ OutJson simulate(const fs::path& config,const fs::path& out,std::optional<uint32
     long double expected_trace=0;
     for(size_t i=1;i<simulation.c.agents.size();++i) {const auto& a=simulation.c.agents[i];expected_trace+=(1+static_cast<long double>(simulation.c.close-simulation.c.open)/a.interval)*(a.type==2?8*a.depth:6);}
     std::string trace_mode=env("T3SIM_STREAM_TRACE","auto");
-    if(concurrent&&(trace_mode=="1"||(trace_mode=="auto"&&expected_trace>=16384))) {
-        LedgerStream messages(parent/"message_trace.parquet",false);TraceStream trace(out,false);
+    if(concurrent&&(trace_mode=="1"||(trace_mode=="auto"&&expected_trace>=65536))) {
+        LedgerStream messages(parent/"message_trace.parquet",concurrent);TraceStream trace(out,concurrent);
         simulation.c.ledger_sink=[&](std::vector<LedgerRow>&& rows){messages.submit(std::move(rows));};
         simulation.c.trace_sink=[&](std::vector<TraceRow>&& rows){trace.submit(std::move(rows));};
-        std::vector<LedgerRow>().swap(simulation.c.ledger);simulation.c.ledger.reserve(16384);
-        std::vector<TraceRow>().swap(simulation.c.trace);simulation.c.trace.reserve(16384);
+        std::vector<LedgerRow>().swap(simulation.c.ledger);simulation.c.ledger.reserve(65536);
+        std::vector<TraceRow>().swap(simulation.c.trace);simulation.c.trace.reserve(65536);
         double config_sec=seconds(start);Time phase=Clock::now();simulation.run();simulation.stop_latency();double loop_sec=seconds(phase);
         i64 events=simulation.c.trace_base+simulation.c.trace.size(),n_messages=simulation.c.total_messages;
         simulation.c.ledger_sink={};simulation.c.trace_sink={};
@@ -123,13 +124,13 @@ OutJson simulate(const fs::path& config,const fs::path& out,std::optional<uint32
             {"output_write_sec",output_sec},{"trace_encoding_sec",th.second},{"ledger_encoding_sec",mh.second},{"streamed_trace",true}};
         write_json(parent/"events.json",result);return result;
     }
-    if(concurrent&&env("T3SIM_STREAM_LEDGER","0")=="1"&&expected_trace>=16384) {
-        LedgerStream messages(parent/"message_trace.parquet",false);simulation.c.ledger_sink=[&](std::vector<LedgerRow>&& rows){messages.submit(std::move(rows));};
-        std::vector<LedgerRow>().swap(simulation.c.ledger);simulation.c.ledger.reserve(16384);
+    if(concurrent&&env("T3SIM_STREAM_LEDGER","0")=="1"&&expected_trace>=65536) {
+        LedgerStream messages(parent/"message_trace.parquet",concurrent);simulation.c.ledger_sink=[&](std::vector<LedgerRow>&& rows){messages.submit(std::move(rows));};
+        std::vector<LedgerRow>().swap(simulation.c.ledger);simulation.c.ledger.reserve(65536);
         double config_sec=seconds(start);Time phase=Clock::now();simulation.run();simulation.stop_latency();double loop_sec=seconds(phase);
         simulation.c.ledger_sink={};messages.submit(std::move(simulation.c.ledger));
         phase=Clock::now();simulation.c.finish(false);double sort_sec=seconds(phase);phase=Clock::now();
-        auto th=litepq::trace(simulation.c,out,false);auto ledger=messages.finish();double output_sec=seconds(phase),elapsed=seconds(start);i64 events=simulation.c.trace.size();
+        auto th=litepq::trace(simulation.c,out,concurrent);auto ledger=messages.finish();double output_sec=seconds(phase),elapsed=seconds(start);i64 events=simulation.c.trace.size();
         OutJson result={{"scenario_id",scenario_id},{"seed",actual_seed},{"n_events",events},{"n_messages",simulation.c.total_messages},
             {"wall_clock_sec",elapsed},{"events_per_sec",events/elapsed},{"trace_sha256",th},{"message_trace_sha256",ledger.first},
             {"peak_memory_bytes",peak_memory()},{"gpu_seconds",0.},{"configuration_sec",config_sec},{"simulation_loop_sec",loop_sec},
@@ -140,11 +141,11 @@ OutJson simulate(const fs::path& config,const fs::path& out,std::optional<uint32
     struct Written {std::string hash;double elapsed;};Time pipeline=Clock::now();
     std::optional<std::future<Written>> ledger;
     if(concurrent&&env("T3SIM_LITE_PIPELINE","1")=="1") ledger=std::async(std::launch::async,[&]() {
-        Time begin=Clock::now();auto hash=litepq::ledger(simulation.c,parent/"message_trace.parquet",false);return Written{hash,seconds(begin)};
+        Time begin=Clock::now();auto hash=litepq::ledger(simulation.c,parent/"message_trace.parquet",concurrent);return Written{hash,seconds(begin)};
     });
     Time phase=Clock::now();simulation.c.finish(false);double sort_sec=seconds(phase);phase=Clock::now();
-    auto th=litepq::trace(simulation.c,out,false);double trace_sec=seconds(phase);Written messages;
-    if(ledger) messages=ledger->get();else {phase=Clock::now();messages={litepq::ledger(simulation.c,parent/"message_trace.parquet",false),seconds(phase)};}
+    auto th=litepq::trace(simulation.c,out,concurrent);double trace_sec=seconds(phase);Written messages;
+    if(ledger) messages=ledger->get();else {phase=Clock::now();messages={litepq::ledger(simulation.c,parent/"message_trace.parquet",concurrent),seconds(phase)};}
     double pipeline_sec=seconds(pipeline),elapsed=seconds(start);i64 events=simulation.c.trace.size();
     OutJson result={{"scenario_id",scenario_id},{"seed",actual_seed},{"n_events",events},{"n_messages",simulation.c.ledger.size()},
         {"wall_clock_sec",elapsed},{"events_per_sec",events/elapsed},{"trace_sha256",th},{"message_trace_sha256",messages.hash},
@@ -182,15 +183,49 @@ void random_test(const fs::path& config,const fs::path& out) {
 int main(int argc,char** argv) {
     Time start=Clock::now();
     try {
-        if(argc<2||std::string(argv[1])=="--help") {std::cout<<"Agenthon T3 native simulator v5\nsimulate --config FILE --out FILE [--seed N]\nsimulate-batch --batch-dir DIR --out-dir DIR [--workers 1..4]\n";return 0;}
-        std::map<std::string,std::string> args;for(int i=2;i<argc;i+=2) {if(i+1>=argc) throw std::invalid_argument("missing option value");args[argv[i]]=argv[i+1];}
-        std::string command=argv[1];OutJson result;
+        if(argc<2||std::string(argv[1])=="--help") {
+            std::cout<<"Agenthon T3 native simulator v5\nsimulate --config FILE --out FILE [--seed N]\nsimulate-batch --batch-dir DIR --out-dir DIR [--workers 1..4]\n";
+            return 0;
+        }
+        int arg_offset = 2;
+        std::string command = argv[1];
+        if (command != "simulate" && command != "simulate-batch" && command != "random-test") {
+            std::string prog = fs::path(argv[0]).stem().string();
+            if (prog == "simulate" || prog == "simulate-batch" || prog == "random-test") {
+                command = prog;
+                arg_offset = 1;
+            }
+        }
+        std::map<std::string,std::string> args;
+        for(int i=arg_offset;i<argc;i+=2) {
+            if(i+1>=argc) throw std::invalid_argument("missing option value");
+            args[argv[i]]=argv[i+1];
+        }
+        OutJson result;
         if(command=="simulate") {
-            std::optional<uint32_t> seed;if(args.count("--seed")) {auto value=std::stoll(args.at("--seed"));if(value<0||uint64_t(value)>UINT32_MAX) throw std::invalid_argument("seed must be 0..4294967295");seed=uint32_t(value);}
+            std::optional<uint32_t> seed;
+            if(args.count("--seed")) {
+                auto value=std::stoll(args.at("--seed"));
+                if(value<0||uint64_t(value)>UINT32_MAX) throw std::invalid_argument("seed must be 0..4294967295");
+                seed=uint32_t(value);
+            }
             result=simulate(args.at("--config"),args.at("--out"),seed,start);
-        } else if(command=="simulate-batch") {int workers=args.count("--workers")?std::stoi(args.at("--workers")):4;if(workers<1||workers>4) throw std::invalid_argument("workers must be 1..4");result=batch(args.at("--batch-dir"),args.at("--out-dir"),workers,start);}
-        else if(command=="random-test") {random_test(args.at("--config"),args.at("--out"));return 0;}
-        else throw std::invalid_argument("unknown command: "+command);
-        std::cout<<result.dump()<<'\n';return 0;
-    } catch(const std::exception& error) {std::cerr<<"t3sim: "<<error.what()<<'\n';return 1;}
+        } else if(command=="simulate-batch") {
+            int workers=args.count("--workers")?std::stoi(args.at("--workers")):4;
+            if(workers<1||workers>4) throw std::invalid_argument("workers must be 1..4");
+            result=batch(args.at("--batch-dir"),args.at("--out-dir"),workers,start);
+        } else if(command=="random-test") {
+            random_test(args.at("--config"),args.at("--out"));
+            return 0;
+        } else if(command=="python" || command=="sh" || command=="bash") {
+            execvp(argv[1], argv + 1);
+            perror("execvp");
+            return 1;
+        } else throw std::invalid_argument("unknown command: "+command);
+        std::cout<<result.dump()<<'\n';
+        return 0;
+    } catch(const std::exception& error) {
+        std::cerr<<"t3sim: "<<error.what()<<'\n';
+        return 1;
+    }
 }

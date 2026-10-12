@@ -70,7 +70,14 @@ public:
         if(b0.size()>1) std::pop_heap(b0.begin(),b0.end(),Tied{});
         CompactScheduled s=b0.back();b0.pop_back();
         s.time=new_time;
-        unsigned dest=index(key(new_time)^last);
+        uint64_t value=key(new_time);
+        if(__builtin_expect(value<last, 0)) {
+            for(auto& bucket:buckets) {for(const auto& old:bucket) fallback.push(old);bucket.clear();}
+            general=true;occupied=0;
+            fallback.push(s);
+            return;
+        }
+        unsigned dest=index(value^last);
         auto& bucket=buckets[dest];bucket.push_back(s);
         if(dest) occupied|=UINT64_C(1)<<(dest-1);
         else std::push_heap(bucket.begin(),bucket.end(),Tied{});

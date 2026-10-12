@@ -84,7 +84,9 @@ COPY scripts/entrypoint_cpp.sh /usr/local/bin/entrypoint
 COPY LICENSE THIRD_PARTY_NOTICES.md SOURCE_PROVENANCE.json /opt/licenses/
 COPY vendor/abides/LICENSE* /opt/licenses/abides/
 COPY vendor/abides_fork/LICENSE /opt/licenses/adapter/LICENSE
-RUN chmod +x /usr/local/bin/entrypoint
+RUN chmod +x /usr/local/bin/entrypoint /opt/t3sim-cpp \
+    && ln -sf /opt/t3sim-cpp /usr/local/bin/simulate \
+    && ln -sf /opt/t3sim-cpp /usr/local/bin/simulate-batch
 WORKDIR /work
-ENTRYPOINT ["entrypoint"]
+ENTRYPOINT ["/opt/t3sim-cpp"]
 CMD ["--help"]

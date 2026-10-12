@@ -305,16 +305,16 @@ public:
     void delivered(const Msg& m) {
         ledger.push_back(LedgerRow{m.id,m.send,m.recv,m.delivery_latency(),m.parent,m.order.id,m.src,m.dst,m.kind});
         ++total_messages;
-        if(ledger_sink && __builtin_expect(ledger.size()>=16384, 0)) {
-            ledger_sink(std::move(ledger));ledger=std::vector<LedgerRow>();ledger.reserve(16384);
+        if(ledger_sink && __builtin_expect(ledger.size()>=65536, 0)) {
+            ledger_sink(std::move(ledger));ledger=std::vector<LedgerRow>();ledger.reserve(65536);
         }
     }
     bool empty() const { return queue.empty(); }
     void trace_boundary(i64 next_time) {
-        if(trace_sink && __builtin_expect(trace.size()>=16384, 0)) {
+        if(trace_sink && __builtin_expect(trace.size()>=65536, 0)) {
             if(next_time!=now) {
                 i64 count=trace.size();trace_sink(std::move(trace));trace_base+=count;
-                trace=std::vector<TraceRow>();trace.reserve(16384);
+                trace=std::vector<TraceRow>();trace.reserve(65536);
             }
         }
     }
