@@ -12,6 +12,8 @@ if [ "${T3_BUILD_PGO:-0}" = 1 ]; then
     T3SIM_STREAM_LEDGER=1 T3SIM_STREAM_TRACE=auto T3SIM_LATENCY_PREFETCH=auto "$BUILD_OUTPUT" simulate-batch --batch-dir /tmp/compiler-input --out-dir /tmp/compiler-small --workers 1
     T3SIM_STREAM_LEDGER=1 T3SIM_STREAM_TRACE=1 T3SIM_LATENCY_PREFETCH=auto "$BUILD_OUTPUT" simulate-batch --batch-dir /tmp/compiler-input --out-dir /tmp/compiler-output --workers 1
     "$BUILD_OUTPUT" simulate-batch --batch-dir /tmp/compiler-input --out-dir /tmp/compiler-batch --workers 4
+    "$BUILD_OUTPUT" simulate --config /tmp/compiler-input/00.json --out /tmp/compiler-single/trace.parquet
+    "$BUILD_OUTPUT" simulate --config /tmp/compiler-input/10.json --out /tmp/compiler-single10/trace.parquet
     g++ $CXX_FLAGS -flto=auto -fprofile-use="$PROFILE_DIR" -fprofile-correction -Werror=missing-profile \
         "$NATIVE_SOURCE/main_lite.cpp" -Wl,--as-needed -lcrypto -lsnappy -l:libsimdjson_static.a -o "$BUILD_OUTPUT"
 else

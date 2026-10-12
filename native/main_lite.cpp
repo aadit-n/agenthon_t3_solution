@@ -37,7 +37,7 @@ OutJson read_json(const fs::path& path) {
     return OutJson::parse(s);
 }
 void write_json(const fs::path& path,const OutJson& value) {
-    std::string s=value.dump(2)+'\n';
+    std::string s=value.dump()+'\n';
     std::FILE* f=std::fopen(path.c_str(),"wb");
     if(!f) throw std::runtime_error("cannot write "+path.string());
     if(std::fwrite(s.data(),1,s.size(),f)!=s.size()) {std::fclose(f);throw std::runtime_error("cannot write "+path.string());}
@@ -60,10 +60,19 @@ public:
                  if(pending.empty()) break;block=std::move(pending.front());pending.pop_front();ready.notify_all();}
                 Time start=Clock::now();
                 if constexpr(TRACE) {
-                    auto compare=[](const TraceRow& a,const TraceRow& b){return std::tie(a.time,a.order_id,a.agent,a.rank)<std::tie(b.time,b.order_id,b.agent,b.rank);};
+                    auto compare=[](const TraceRow& a,const TraceRow& b){
+                        if (a.order_id != b.order_id) return a.order_id < b.order_id;
+                        if (a.agent != b.agent) return a.agent < b.agent;
+                        return a.rank < b.rank;
+                    };
                     for(size_t begin=0;begin<block.size();) {
                         size_t end=begin+1;while(end<block.size()&&block[end].time==block[begin].time) ++end;
-                        if(end-begin>1) std::sort(block.begin()+begin,block.begin()+end,compare);begin=end;
+                        if(end-begin>1) {
+                            if(end-begin==2) {
+                                if(compare(block[begin+1], block[begin])) std::swap(block[begin], block[begin+1]);
+                            } else std::sort(block.begin()+begin,block.begin()+end,compare);
+                        }
+                        begin=end;
                     }
                     writer.append_trace(block,0,block.size());
                 } else litepq::ledger_block(writer,block,first);
@@ -87,7 +96,7 @@ using LedgerStream=FileStream<LedgerRow>;
 using TraceStream=FileStream<TraceRow,true>;
 OutJson simulate(const fs::path& config,const fs::path& out,std::optional<uint32_t> seed={},std::optional<Time> since={},bool concurrent=true) {
     Time start=since.value_or(Clock::now());
-    simdjson::dom::parser parser;
+    thread_local simdjson::dom::parser parser;
     simdjson::padded_string json_data=simdjson::padded_string::load(config.string());
     JsonView scenario(parser.parse(json_data).value());
     Simulation simulation(scenario,seed,concurrent);
@@ -97,11 +106,11 @@ OutJson simulate(const fs::path& config,const fs::path& out,std::optional<uint32
     long double expected_trace=0;
     for(size_t i=1;i<simulation.c.agents.size();++i) {const auto& a=simulation.c.agents[i];expected_trace+=(1+static_cast<long double>(simulation.c.close-simulation.c.open)/a.interval)*(a.type==2?8*a.depth:6);}
     std::string trace_mode=env("T3SIM_STREAM_TRACE","auto");
-    if(concurrent&&(trace_mode=="1"||(trace_mode=="auto"&&expected_trace>=65536))) {
-        LedgerStream messages(parent/"message_trace.parquet",concurrent);TraceStream trace(out,concurrent);
+    if(concurrent&&(trace_mode=="1"||(trace_mode=="auto"&&expected_trace>=16384))) {
+        LedgerStream messages(parent/"message_trace.parquet",false);TraceStream trace(out,false);
         simulation.c.ledger_sink=[&](std::vector<LedgerRow>&& rows){messages.submit(std::move(rows));};
         simulation.c.trace_sink=[&](std::vector<TraceRow>&& rows){trace.submit(std::move(rows));};
-        std::vector<LedgerRow>().swap(simulation.c.ledger);simulation.c.ledger.reserve(65536);
+        std::vector<LedgerRow>().swap(simulation.c.ledger);simulation.c.ledger.reserve(16384);
         std::vector<TraceRow>().swap(simulation.c.trace);simulation.c.trace.reserve(16384);
         double config_sec=seconds(start);Time phase=Clock::now();simulation.run();simulation.stop_latency();double loop_sec=seconds(phase);
         i64 events=simulation.c.trace_base+simulation.c.trace.size(),n_messages=simulation.c.total_messages;
@@ -114,13 +123,13 @@ OutJson simulate(const fs::path& config,const fs::path& out,std::optional<uint32
             {"output_write_sec",output_sec},{"trace_encoding_sec",th.second},{"ledger_encoding_sec",mh.second},{"streamed_trace",true}};
         write_json(parent/"events.json",result);return result;
     }
-    if(concurrent&&env("T3SIM_STREAM_LEDGER","0")=="1"&&expected_trace>=65536) {
-        LedgerStream messages(parent/"message_trace.parquet",concurrent);simulation.c.ledger_sink=[&](std::vector<LedgerRow>&& rows){messages.submit(std::move(rows));};
-        std::vector<LedgerRow>().swap(simulation.c.ledger);simulation.c.ledger.reserve(65536);
+    if(concurrent&&env("T3SIM_STREAM_LEDGER","0")=="1"&&expected_trace>=16384) {
+        LedgerStream messages(parent/"message_trace.parquet",false);simulation.c.ledger_sink=[&](std::vector<LedgerRow>&& rows){messages.submit(std::move(rows));};
+        std::vector<LedgerRow>().swap(simulation.c.ledger);simulation.c.ledger.reserve(16384);
         double config_sec=seconds(start);Time phase=Clock::now();simulation.run();simulation.stop_latency();double loop_sec=seconds(phase);
         simulation.c.ledger_sink={};messages.submit(std::move(simulation.c.ledger));
         phase=Clock::now();simulation.c.finish(false);double sort_sec=seconds(phase);phase=Clock::now();
-        auto th=litepq::trace(simulation.c,out,concurrent);auto ledger=messages.finish();double output_sec=seconds(phase),elapsed=seconds(start);i64 events=simulation.c.trace.size();
+        auto th=litepq::trace(simulation.c,out,false);auto ledger=messages.finish();double output_sec=seconds(phase),elapsed=seconds(start);i64 events=simulation.c.trace.size();
         OutJson result={{"scenario_id",scenario_id},{"seed",actual_seed},{"n_events",events},{"n_messages",simulation.c.total_messages},
             {"wall_clock_sec",elapsed},{"events_per_sec",events/elapsed},{"trace_sha256",th},{"message_trace_sha256",ledger.first},
             {"peak_memory_bytes",peak_memory()},{"gpu_seconds",0.},{"configuration_sec",config_sec},{"simulation_loop_sec",loop_sec},
@@ -131,11 +140,11 @@ OutJson simulate(const fs::path& config,const fs::path& out,std::optional<uint32
     struct Written {std::string hash;double elapsed;};Time pipeline=Clock::now();
     std::optional<std::future<Written>> ledger;
     if(concurrent&&env("T3SIM_LITE_PIPELINE","1")=="1") ledger=std::async(std::launch::async,[&]() {
-        Time begin=Clock::now();auto hash=litepq::ledger(simulation.c,parent/"message_trace.parquet",concurrent);return Written{hash,seconds(begin)};
+        Time begin=Clock::now();auto hash=litepq::ledger(simulation.c,parent/"message_trace.parquet",false);return Written{hash,seconds(begin)};
     });
     Time phase=Clock::now();simulation.c.finish(false);double sort_sec=seconds(phase);phase=Clock::now();
-    auto th=litepq::trace(simulation.c,out,concurrent);double trace_sec=seconds(phase);Written messages;
-    if(ledger) messages=ledger->get();else {phase=Clock::now();messages={litepq::ledger(simulation.c,parent/"message_trace.parquet",concurrent),seconds(phase)};}
+    auto th=litepq::trace(simulation.c,out,false);double trace_sec=seconds(phase);Written messages;
+    if(ledger) messages=ledger->get();else {phase=Clock::now();messages={litepq::ledger(simulation.c,parent/"message_trace.parquet",false),seconds(phase)};}
     double pipeline_sec=seconds(pipeline),elapsed=seconds(start);i64 events=simulation.c.trace.size();
     OutJson result={{"scenario_id",scenario_id},{"seed",actual_seed},{"n_events",events},{"n_messages",simulation.c.ledger.size()},
         {"wall_clock_sec",elapsed},{"events_per_sec",events/elapsed},{"trace_sha256",th},{"message_trace_sha256",messages.hash},
@@ -151,6 +160,7 @@ int cpu_budget() {
 OutJson batch(const fs::path& input,const fs::path& output,int workers,Time start) {
     std::vector<fs::path> paths;for(const auto& file:fs::directory_iterator(input)) if(file.is_regular_file()&&file.path().extension()==".json") paths.push_back(file.path());
     std::sort(paths.begin(),paths.end());if(paths.empty()) throw std::invalid_argument("no scenario JSON files");
+    for(const auto& p:paths) fs::create_directories(output / p.stem());
     workers=std::min({workers,cpu_budget(),int(paths.size())});std::vector<OutJson> results(paths.size());std::atomic<size_t> next{0};std::mutex mutex;std::exception_ptr failure;
     auto work=[&]() {
         try {while(true) {size_t i=next.fetch_add(1);if(i>=paths.size()) break;results[i]=simulate(paths[i],output/paths[i].stem()/"trace.parquet",{},{},workers==1);}}

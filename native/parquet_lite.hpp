@@ -7,6 +7,10 @@
 #include <limits>
 #include <type_traits>
 #include <future>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 #ifdef T3_FAST_SNAPPY
 namespace snappy_fast {void RawCompress(const char*,size_t,char*,size_t*);}
 #endif
@@ -115,6 +119,27 @@ struct Output {
 };
 template<int WIDTH> void pack32(Bytes& out,const uint64_t* values) {
     if constexpr(WIDTH>0) {
+        if constexpr(WIDTH==64) {
+            size_t offset=out.size();out.resize(offset+256);std::memcpy(out.data()+offset,values,256);return;
+        } else if constexpr(WIDTH==32) {
+            size_t offset=out.size();out.resize(offset+128);
+            uint32_t* dst=reinterpret_cast<uint32_t*>(out.data()+offset);
+            #pragma GCC unroll 32
+            for(int i=0;i<32;++i) dst[i]=uint32_t(values[i]);
+            return;
+        } else if constexpr(WIDTH==16) {
+            size_t offset=out.size();out.resize(offset+64);
+            uint16_t* dst=reinterpret_cast<uint16_t*>(out.data()+offset);
+            #pragma GCC unroll 32
+            for(int i=0;i<32;++i) dst[i]=uint16_t(values[i]);
+            return;
+        } else if constexpr(WIDTH==8) {
+            size_t offset=out.size();out.resize(offset+32);
+            uint8_t* dst=out.data()+offset;
+            #pragma GCC unroll 32
+            for(int i=0;i<32;++i) dst[i]=uint8_t(values[i]);
+            return;
+        }
         uint64_t words[WIDTH/2+1]={};
         #pragma GCC unroll 32
         for(int i=0;i<32;++i) {
@@ -140,11 +165,11 @@ void bitpack32(Bytes& out,const uint64_t* values,int width) {
     #undef LITE_PACK_CASE
 }
 int bit_width(uint64_t value) {return value?64-__builtin_clzll(value):0;}
-template<class T,class Allocator>
+template<class T,class Container>
 #ifdef T3_VECTOR_DELTA
 __attribute__((target_clones("avx2","default")))
 #endif
-void delta_into(Bytes& out,const std::vector<T,Allocator>& values) {
+void delta_into(Bytes& out,const Container& values) {
     out.reserve(out.size()+values.size()*sizeof(T)/2+64);
     varint(out,128);varint(out,4);varint(out,values.size());varint(out,zigzag(values.empty()?0:values[0]));
     using U=std::make_unsigned_t<T>;T previous=values.empty()?0:values[0];
@@ -164,9 +189,9 @@ void delta_into(Bytes& out,const std::vector<T,Allocator>& values) {
         for(int mini=0;mini<4;++mini) bitpack32(out,normalized+mini*32,widths[mini]);
     }
 }
-template<class T,class Allocator> Bytes delta(const std::vector<T,Allocator>& values) {Bytes out;delta_into(out,values);return out;}
-template<int WIDTH,class F> Bytes narrow_indices(int64_t n,F get) {
-    Bytes out;out.reserve(size_t((n+7)/8*WIDTH+16));out.push_back(uint8_t(WIDTH));varint(out,uint64_t((n+7)/8)*2+1);
+template<class T,class Container> Bytes delta(const Container& values) {Bytes out;delta_into<T>(out,values);return out;}
+template<int WIDTH,class F> void narrow_indices_into(Bytes& out,int64_t n,F get) {
+    out.reserve(out.size()+size_t((n+7)/8*WIDTH+16));out.push_back(uint8_t(WIDTH));varint(out,uint64_t((n+7)/8)*2+1);
     size_t prefix=out.size();out.resize(prefix+size_t((n+7)/8)*WIDTH);
     int64_t full=n/8*8;
     for(int64_t first=0;first<full;first+=8) {
@@ -179,26 +204,33 @@ template<int WIDTH,class F> Bytes narrow_indices(int64_t n,F get) {
         uint64_t packed=0;for(int i=0;full+i<n;++i) packed|=uint64_t(get(full+i))<<(i*WIDTH);
         std::memcpy(out.data()+prefix+size_t(full/8)*WIDTH,&packed,WIDTH);
     }
-    return out;
 }
-template<class F> Bytes dictionary_indices(int64_t n,int width,F get) {
+template<class F> void dictionary_indices_into(Bytes& out,int64_t n,int width,F get) {
 #ifdef T3_NARROW_CODES
     switch(width) {
-        case 1:return narrow_indices<1>(n,get);case 2:return narrow_indices<2>(n,get);
-        case 3:return narrow_indices<3>(n,get);case 4:return narrow_indices<4>(n,get);
-        case 5:return narrow_indices<5>(n,get);case 6:return narrow_indices<6>(n,get);
-        case 7:return narrow_indices<7>(n,get);case 8:return narrow_indices<8>(n,get);
+        case 1:narrow_indices_into<1>(out,n,get);return;case 2:narrow_indices_into<2>(out,n,get);return;
+        case 3:narrow_indices_into<3>(out,n,get);return;case 4:narrow_indices_into<4>(out,n,get);return;
+        case 5:narrow_indices_into<5>(out,n,get);return;case 6:narrow_indices_into<6>(out,n,get);return;
+        case 7:narrow_indices_into<7>(out,n,get);return;case 8:narrow_indices_into<8>(out,n,get);return;
     }
 #endif
-    Bytes out;out.reserve(size_t((n+7)/8*width+16));out.push_back(uint8_t(width));varint(out,uint64_t((n+7)/8)*2+1);
+    out.reserve(out.size()+size_t((n+7)/8*width+16));out.push_back(uint8_t(width));varint(out,uint64_t((n+7)/8)*2+1);
     for(int64_t first=0;first<n;first+=8) {
         __uint128_t packed=0;
         for(int i=0;i<8&&first+i<n;++i) packed|=__uint128_t(get(first+i))<<(i*width);
         for(int i=0;i<width;++i) out.push_back(uint8_t(packed>>(i*8)));
     }
-    return out;
 }
-struct Field {std::string name;int physical;bool nullable=false,categorical=false;std::vector<std::string> labels;};
+struct Field {
+    std::string name;int physical=0;bool nullable=false,categorical=false;std::vector<std::string> labels;
+    Bytes dict_bytes;
+    Field(std::string n,int p,bool null=false,bool cat=false,std::vector<std::string> l={}):
+        name(std::move(n)),physical(p),nullable(null),categorical(cat),labels(std::move(l)) {
+        if(!labels.empty()) {
+            for(const auto& val:labels) {little32(dict_bytes,val.size());dict_bytes.insert(dict_bytes.end(),val.begin(),val.end());}
+        }
+    }
+};
 struct Chunk {int physical,encoding;int64_t n,data_offset=0,dict_offset=-1,compressed=0,uncompressed=0;};
 struct Group {int64_t n,bytes=0,compressed=0;std::vector<Chunk> columns;};
 std::string pandas(const std::vector<Field>& fields) {
@@ -271,6 +303,7 @@ class Writer {
             p.object(5,[&](Compact& h){h.integer(1,count);h.integer(2,cp.chunk.encoding);h.integer(3,3);h.integer(4,3);});cp.rel_data_offset=cp.bytes.size();
         }
         p.end();cp.chunk.uncompressed+=header.size()+raw.size();cp.chunk.compressed+=header.size()+size;
+        cp.bytes.reserve(cp.bytes.size()+header.size()+size);
         cp.bytes.insert(cp.bytes.end(),header.begin(),header.end());
         cp.bytes.insert(cp.bytes.end(),reinterpret_cast<const uint8_t*>(scratch.data()),reinterpret_cast<const uint8_t*>(scratch.data())+size);
     }
@@ -286,61 +319,33 @@ class Writer {
             cp.chunk.encoding=5;page_into(cp,raw,int(n),false,scratch);return cp;
         }
 #endif
-#ifdef T3_INDEXED_VALUES
-        Buffer<T> values;values.resize(n);size_t valid=0;Bytes levels;
-#else
-        std::vector<T> values;values.reserve(n);Bytes levels;
-#endif
         if(field.nullable) {
+            Buffer<T> values;values.resize(n);size_t valid=0;Bytes levels;
             varint(levels,uint64_t((n+7)/8)*2+1);size_t prefix=levels.size();levels.resize(prefix+size_t((n+7)/8),0);
             for(int64_t i=0;i<n;++i) {T value=T(get(first+i));if(value>=0) {
-#ifdef T3_INDEXED_VALUES
                 values[valid++]=value;
-#else
-                values.push_back(value);
-#endif
                 levels[prefix+size_t(i/8)]|=uint8_t(1<<(i%8));}}
-#ifdef T3_INDEXED_VALUES
             values.resize(valid);
-#endif
-        } else {varint(levels,uint64_t(n)*2);levels.push_back(1);for(int64_t i=0;i<n;++i) {
-#ifdef T3_INDEXED_VALUES
-            values[i]=T(get(first+i));
-#else
-            values.push_back(T(get(first+i)));
-#endif
-        }}
-        Bytes raw;little32(raw,levels.size());raw.insert(raw.end(),levels.begin(),levels.end());
-        bool dictionary=false;
-        if(field.categorical&&env("T3SIM_LITE_DICT","0")=="1"&&!values.empty()) {
-            auto limits=std::minmax_element(values.begin(),values.end());T minimum=*limits.first,maximum=*limits.second;uint64_t range=uint64_t(maximum)-uint64_t(minimum);
-            if(range<4096&&range+1<uint64_t(n)) {
-                Bytes dict;dict.resize(size_t(range+1)*sizeof(T));for(uint64_t i=0;i<=range;++i) {T value=minimum+T(i);std::memcpy(dict.data()+i*sizeof(T),&value,sizeof(T));}
-                page_into(cp,dict,int(range+1),true,scratch);cp.chunk.encoding=8;
-                auto indices=dictionary_indices(n,std::max(1,bit_width(range)),[&](int64_t i){return uint64_t(values[i])-uint64_t(minimum);});
-                raw.insert(raw.end(),indices.begin(),indices.end());dictionary=true;
-            }
+            Bytes raw;little32(raw,levels.size());raw.insert(raw.end(),levels.begin(),levels.end());
+            cp.chunk.encoding=5;delta_into<T>(raw,values);
+            page_into(cp,raw,int(n),false,scratch);return cp;
+        } else {
+            Buffer<T> values;values.resize(n);
+            for(int64_t i=0;i<n;++i) values[i]=T(get(first+i));
+            Bytes levels;varint(levels,uint64_t(n)*2);levels.push_back(1);
+            Bytes raw;little32(raw,levels.size());raw.insert(raw.end(),levels.begin(),levels.end());
+            cp.chunk.encoding=5;delta_into<T>(raw,values);
+            page_into(cp,raw,int(n),false,scratch);return cp;
         }
-        if(!dictionary&&plain_numeric) {
-            cp.chunk.encoding=0;size_t first_idx=raw.size();raw.resize(first_idx+values.size()*sizeof(T));
-            if(!values.empty()) std::memcpy(raw.data()+first_idx,values.data(),values.size()*sizeof(T));
-        } else if(!dictionary) {
-#ifdef T3_FUSED_DELTA
-            cp.chunk.encoding=5;delta_into(raw,values);
-#else
-            auto encoded=delta(values);cp.chunk.encoding=5;raw.insert(raw.end(),encoded.begin(),encoded.end());
-#endif
-        }
-        page_into(cp,raw,int(n),false,scratch);return cp;
     }
 
     template<class F> ColumnPayload encode_strings(const Field& field,int64_t first,int64_t n,F get,Buffer<char>& scratch) {
         ColumnPayload cp{Chunk{field.physical,8,n},{}};
-        Bytes dict;for(const auto& value:field.labels) {little32(dict,value.size());dict.insert(dict.end(),value.begin(),value.end());}
-        page_into(cp,dict,field.labels.size(),true,scratch);cp.chunk.encoding=8;
+        page_into(cp,field.dict_bytes,field.labels.size(),true,scratch);cp.chunk.encoding=8;
         Bytes levels;varint(levels,uint64_t(n)*2);levels.push_back(1);Bytes raw;little32(raw,levels.size());raw.insert(raw.end(),levels.begin(),levels.end());
-        auto indices=dictionary_indices(n,std::max(1,bit_width(field.labels.size()-1)),[&](int64_t i){return get(first+i);});
-        raw.insert(raw.end(),indices.begin(),indices.end());page_into(cp,raw,int(n),false,scratch);return cp;
+        int width=std::max(1,bit_width(field.labels.size()-1));
+        dictionary_indices_into(raw,n,width,[&](int64_t i){return get(first+i);});
+        page_into(cp,raw,int(n),false,scratch);return cp;
     }
 
     void write_payload(Group& group,ColumnPayload&& cp) {
@@ -354,7 +359,11 @@ class Writer {
     }
 
 public:
-    Writer(const fs::path& path,std::vector<Field> schema,bool parallel_mode=false):output(path),fields(std::move(schema)),parallel(parallel_mode) {output.write("PAR1",4);}
+    Writer(const fs::path& path,std::vector<Field> schema,bool parallel_mode=false):output(path),fields(std::move(schema)),parallel(parallel_mode) {
+        output.write("PAR1",4);
+        type_codes.reserve(16384);
+        last_execution.resize(4096,SIZE_MAX);
+    }
 
     template<class F> void append(int64_t n,F get) {
         if(n<=0) return;Group group{n};group.columns.reserve(fields.size());
@@ -409,7 +418,8 @@ public:
             const auto& row=trace[first+i];int kind=row.kind;
             if(kind==EXEC) {
                 if(row.order_id<0) throw std::runtime_error("execution has no order ID");
-                if(size_t(row.order_id)>=last_execution.size()) last_execution.resize(size_t(row.order_id)+1,SIZE_MAX);
+                if(__builtin_expect(size_t(row.order_id)>=last_execution.size(), 0))
+                    last_execution.resize(std::max(size_t(row.order_id)*2+1, size_t(65536)),SIZE_MAX);
                 size_t& previous=last_execution[size_t(row.order_id)];if(previous!=SIZE_MAX) type_codes[previous]=PARTIAL;
                 previous=type_codes.size();kind=FILL;
             }

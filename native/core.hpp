@@ -93,8 +93,10 @@ struct Scheduled {
     i64 time;
     Msg msg;
     bool operator<(const Scheduled& other) const {
-        return std::tie(time,msg.src,msg.dst,msg.id) >
-               std::tie(other.time,other.msg.src,other.msg.dst,other.msg.id);
+        if (time != other.time) return time > other.time;
+        if (msg.src != other.msg.src) return msg.src > other.msg.src;
+        if (msg.dst != other.msg.dst) return msg.dst > other.msg.dst;
+        return msg.id > other.msg.id;
     }
 };
 #ifdef T3_STANDALONE
@@ -137,9 +139,14 @@ struct CompactScheduled {
     }
     bool operator<(const CompactScheduled& other) const {
 #ifdef T3_PACKED_ROUTE
-        return std::tie(time,route,id)>std::tie(other.time,other.route,other.id);
+        if (time != other.time) return time > other.time;
+        if (route != other.route) return route > other.route;
+        return id > other.id;
 #else
-        return std::tie(time,src,dst,id)>std::tie(other.time,other.src,other.dst,other.id);
+        if (time != other.time) return time > other.time;
+        if (src != other.src) return src > other.src;
+        if (dst != other.dst) return dst > other.dst;
+        return id > other.id;
 #endif
     }
 };
@@ -285,7 +292,7 @@ public:
 #ifdef T3_STANDALONE
         const char* option=std::getenv("T3SIM_TRACK_ALL_ORDERS");
         track_all_orders=option&&std::strcmp(option,"1")==0;
-        messages.reserve(1024);free_slots.reserve(1024);
+        messages.reserve(16384);free_slots.reserve(16384);
 #endif
     }
     inline __attribute__((always_inline)) Msg make(int kind) { Msg m; m.id=next_msg++; m.kind=kind; return m; }
@@ -298,8 +305,8 @@ public:
     void delivered(const Msg& m) {
         ledger.push_back(LedgerRow{m.id,m.send,m.recv,m.delivery_latency(),m.parent,m.order.id,m.src,m.dst,m.kind});
         ++total_messages;
-        if(ledger_sink && __builtin_expect(ledger.size()>=65536, 0)) {
-            ledger_sink(std::move(ledger));ledger=std::vector<LedgerRow>();ledger.reserve(65536);
+        if(ledger_sink && __builtin_expect(ledger.size()>=16384, 0)) {
+            ledger_sink(std::move(ledger));ledger=std::vector<LedgerRow>();ledger.reserve(16384);
         }
     }
     bool empty() const { return queue.empty(); }
@@ -319,12 +326,16 @@ public:
         return queue.top();
     }
     void postpone_top(i64 new_time) {
+        trace_boundary(queue.top().time);
+        now=queue.top().time;
+#if defined(T3_FOUR_HEAP) || defined(T3_RADIX_QUEUE)
+        queue.postpone_top(new_time);
+#else
         CompactScheduled s=queue.top();
         queue.pop();
-        trace_boundary(s.time);
-        now=s.time;
         s.time=new_time;
         queue.push(s);
+#endif
     }
 #endif
 #ifdef T3_REF_MESSAGES
@@ -377,13 +388,14 @@ public:
     void postpone(Msg&& m, i64 time) {
 #ifdef T3_STANDALONE
         uint32_t slot;
+        i64 mid=m.id; int msrc=m.src, mdst=m.dst;
 #ifdef T3_REF_MESSAGES
         if(held_message!=UINT32_MAX && &m==&messages[held_message]) {slot=held_message;held_message=UINT32_MAX;}
         else
 #endif
         if (free_slots.empty()) { slot=messages.size();messages.push_back(std::move(m)); }
         else { slot=free_slots.back();free_slots.pop_back();messages[slot]=std::move(m); }
-        queue.push(CompactScheduled{time,messages[slot].id,messages[slot].src,messages[slot].dst,slot});
+        queue.push(CompactScheduled{time,mid,msrc,mdst,slot});
 #else
         queue.push(Scheduled{time,std::move(m)});
 #endif
@@ -435,17 +447,39 @@ public:
 #ifdef T3_STANDALONE
         const char* option=std::getenv("T3SIM_FULL_SORT");
         bool full=option&&std::strcmp(option,"1")==0;
-        if (!full&&!std::is_sorted(trace.begin(),trace.end(),[](const TraceRow& a,const TraceRow& b){return a.time<b.time;})) full=true;
         auto compare=[](const TraceRow& a,const TraceRow& b) {
-            return std::tie(a.time,a.order_id,a.agent,a.rank)<std::tie(b.time,b.order_id,b.agent,b.rank);
+            if (a.order_id != b.order_id) return a.order_id < b.order_id;
+            if (a.agent != b.agent) return a.agent < b.agent;
+            return a.rank < b.rank;
         };
-        if (full) std::sort(trace.begin(),trace.end(),compare);
-        else {
+        auto full_compare=[](const TraceRow& a,const TraceRow& b) {
+            if (a.time != b.time) return a.time < b.time;
+            if (a.order_id != b.order_id) return a.order_id < b.order_id;
+            if (a.agent != b.agent) return a.agent < b.agent;
+            return a.rank < b.rank;
+        };
+        if (full) {
+            std::sort(trace.begin(),trace.end(),full_compare);
+        } else {
             // Event dispatch already emits timestamps in order. Only equal-time
             // runs need canonical order-ID/agent/stable-rank sorting.
             for (size_t first=0;first<trace.size();) {
                 size_t last=first+1;while (last<trace.size()&&trace[last].time==trace[first].time) ++last;
-                if (last-first>1) std::sort(trace.begin()+first,trace.begin()+last,compare);
+                if (last-first>1) {
+                    if (last-first==2) {
+                        if (compare(trace[first+1], trace[first])) std::swap(trace[first], trace[first+1]);
+                    } else if (last-first==3) {
+                        if (compare(trace[first+1], trace[first])) std::swap(trace[first], trace[first+1]);
+                        if (compare(trace[first+2], trace[first+1])) {
+                            std::swap(trace[first+1], trace[first+2]);
+                            if (compare(trace[first+1], trace[first])) std::swap(trace[first], trace[first+1]);
+                        }
+                    } else std::sort(trace.begin()+first,trace.begin()+last,compare);
+                }
+                if (last<trace.size()&&trace[last].time<trace[first].time) {
+                    std::sort(trace.begin(),trace.end(),full_compare);
+                    break;
+                }
                 first=last;
             }
         }

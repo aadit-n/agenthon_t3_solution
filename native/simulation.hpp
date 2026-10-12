@@ -58,8 +58,9 @@ public:
         theta=p.value("sigma",5e-5);shock_mean=p.value("jump_sigma",0.);
         variance_coefficient=std::pow(theta,2)/(2*gamma);
         if (!shock_mean) shock_mean=1000;
-        if (p.contains("scheduled_jump")&&!p["scheduled_jump"].is_null()&&!p["scheduled_jump"].empty()) {
-            const auto& j=p["scheduled_jump"];jump_pending=true;
+        auto j=p["scheduled_jump"];
+        if (j.is_valid()&&!j.is_null()&&!j.empty()) {
+            jump_pending=true;
             jump_time=previous.integer+j.at("time_ns").get<i64>();jump_value=j.at("magnitude").get<i64>();
         }
         shock_time=double(previous.integer)+global.exponential(1/rate);shock_value=shock();
@@ -94,7 +95,7 @@ class Simulation {
     std::unique_ptr<LatencyStream> latency_stream;
     std::unique_ptr<ActionStream> action_stream;
     bool action_latency=false;
-    NoiseAction noise_action(int agent) {
+    inline __attribute__((always_inline)) NoiseAction noise_action(int agent) {
         const auto& a=c.agents[agent];
         i64 size=std::max<i64>(1,rounded_integer(rngs[agent].normal(a.mean,a.stddev)));
         int buy=rngs[agent].bounded(2);
@@ -111,9 +112,9 @@ class Simulation {
                  (latency_min>0?latency_min:1)*(1+latency_rng.pareto(latency_alpha));
         return rounded_integer(std::max(latency_min,std::min(latency_max,v)));
     }
-    i64 latency_for(int sender,int recipient) {
+    inline __attribute__((always_inline)) i64 latency_for(int sender,int recipient) {
         if (sender==recipient) return 0;
-        if (latency_kind==4) return fixed_latency;
+        if (__builtin_expect(latency_kind==4, 1)) return fixed_latency;
         if (latency_kind==0) {
             if(sender==0||recipient==0) return exchange_latencies[sender==0?recipient:sender];
             double distance=locations[sender]-locations[recipient];
@@ -121,24 +122,24 @@ class Simulation {
         }
         return action_latency?action_stream->next_latency():latency_stream?latency_stream->next():sampled_latency();
     }
-    void send(int sender,int recipient,Msg&& msg) {
+    inline __attribute__((always_inline)) void send(int sender,int recipient,Msg&& msg) {
         msg.src=sender;msg.dst=recipient;msg.parent=c.causal;
         msg.send=c.now+c.agents[sender].delay;
         if (sender==0&&(msg.kind==ACCEPTED||msg.kind==EXECUTED||msg.kind==CANCELLED)) msg.send+=c.ack_delay;
         msg.arrive(latency_for(sender,recipient));c.enqueue(std::move(msg));
     }
-    void send(int sender,int recipient,const Msg& msg) { Msg copy=msg; send(sender,recipient,std::move(copy)); }
-    void simple(int sender,int recipient,int kind) { send(sender,recipient,c.make(kind)); }
-    void order_message(int sender,int kind,const Order& order) {
+    inline __attribute__((always_inline)) void send(int sender,int recipient,const Msg& msg) { Msg copy=msg; send(sender,recipient,std::move(copy)); }
+    inline __attribute__((always_inline)) void simple(int sender,int recipient,int kind) { send(sender,recipient,c.make(kind)); }
+    inline __attribute__((always_inline)) void order_message(int sender,int kind,const Order& order) {
         Msg msg=c.make(kind);msg.order=order;send(sender,sender?0:order.agent,std::move(msg));
     }
-    void place(int agent,i64 size,int side,i64 price) {
+    inline __attribute__((always_inline)) void place(int agent,i64 size,int side,i64 price) {
         Order o;o.id=c.next_order++;o.agent=agent;o.quantity=size;o.side=side;o.price=price;
         c.remember(agent,o);order_message(agent,LIMIT,o);c.log(agent,SUBMITTED,o);
     }
-    void act(int agent,i64 bid,i64 ask) {
+    inline __attribute__((always_inline)) void act(int agent,i64 bid,i64 ask) {
         auto& a=c.agents[agent];
-        if (a.type==1) {
+        if (__builtin_expect(a.type==1, 1)) {
             NoiseAction action=action_stream?action_stream->next_noise(agent):noise_action(agent);
             i64 size=action.size,offset=action.offset;int buy=action.buy;
             i64 anchor=buy?(ask?ask:(bid?bid:a.reference)):(bid?bid:(ask?ask:a.reference));
@@ -229,7 +230,7 @@ public:
         const auto& ex=scenario.at("exchange_config");
         if (ex.value("protocol_enforcement",false)) {
             c.ack_delay=ex.value("ack_delay_ns",i64(0));c.compute_delay=ex.value("compute_delay_ns",i64(0));
-            std::string stp=ex.contains("stp_policy")&&!ex["stp_policy"].is_null()?ex["stp_policy"].get<std::string>():std::string();
+            std::string stp=ex.value("stp_policy",std::string());
             c.stp=stp=="cancel_oldest"?1:(!stp.empty()?2:0);
         }
         i64 reference=scenario.at("oracle_config").value("params",Json()).value("initial_price",i64(100000));
@@ -238,7 +239,7 @@ public:
             std::string kind=group.at("agent_type").get<std::string>();const Json p=group.value("params",Json());
             AgentState a;a.time=c.now;a.reference=reference;
             double hz=p.value("arrival_rate_hz",1.);
-            a.interval=std::max<i64>(1,p.contains("rebalance_interval_ns")?p["rebalance_interval_ns"].get<i64>():hz>0?i64(1e9/hz):1000000000);
+            a.interval=std::max<i64>(1,p.value("rebalance_interval_ns",hz>0?i64(1e9/hz):1000000000));
             if (kind=="NoiseTrader") {
                 a.type=1;a.mean=p.value("order_size_mean",10.);a.stddev=p.value("order_size_std",2.);a.offset=p.value("price_offset_ticks",i64(5));
                 if (a.stddev<0||a.offset<0) throw std::invalid_argument("negative noise scale/offset");
@@ -260,12 +261,15 @@ public:
                 trace_estimate+=actions*(a.type==2?8*a.depth:6);
                 ledger_estimate+=actions*(a.type==2?8*a.depth+6:8);
             }
-            c.trace.reserve(size_t(std::max(65536.L,std::min(262144.L,trace_estimate))));
-            c.ledger.reserve(size_t(std::max(65536.L,std::min(262144.L,ledger_estimate))));
+            size_t target_trace = size_t(trace_estimate * 1.25L);
+            size_t target_ledger = size_t(ledger_estimate * 1.25L);
+            c.trace.reserve(std::max<size_t>(65536, std::min<size_t>(1048576, target_trace)));
+            c.ledger.reserve(std::max<size_t>(65536, std::min<size_t>(1048576, target_ledger)));
         }
         latency_rng=Random(global.word());
-        if (scenario.contains("latency_config")&&!scenario["latency_config"].is_null()&&!scenario["latency_config"].empty()) {
-            auto latency=scenario["latency_config"];Json p=latency.value("params",Json());
+        auto latency=scenario["latency_config"];
+        if (latency.is_valid()&&!latency.is_null()&&!latency.empty()) {
+            Json p=latency.value("params",Json());
             std::string model=latency.value("model",std::string("deterministic"));
             latency_kind=model=="uniform"?1:model=="log_normal"?2:model=="pareto"?3:4;
             double mean=p.value("mean_ns",0.);latency_mu=mean>0?std::log(mean):0;

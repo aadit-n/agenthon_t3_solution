@@ -28,7 +28,7 @@ public:
         for (uint32_t i=1;i<624;++i)
             state[i]=1812433253U*(state[i-1]^(state[i-1]>>30))+i;
     }
-    uint32_t word() {
+    inline __attribute__((always_inline)) uint32_t word() {
         if (__builtin_expect(position==624, 0)) {
             for (int i=0;i<227;++i) {
                 uint32_t y=(state[i]&0x80000000U)|(state[i+1]&0x7fffffffU);
@@ -46,16 +46,15 @@ public:
         y^=y>>11; y^=(y<<7)&0x9d2c5680U; y^=(y<<15)&0xefc60000U;
         return y^(y>>18);
     }
-    double uniform01() {
+    inline __attribute__((always_inline)) double uniform01() {
         uint32_t a=word()>>5,b=word()>>6;
         return (a*67108864.0+b)*(1.0/9007199254740992.0);
     }
-    static uint64_t mask_for(uint64_t maximum) {
-        uint64_t mask=maximum;
-        mask|=mask>>1;mask|=mask>>2;mask|=mask>>4;mask|=mask>>8;mask|=mask>>16;mask|=mask>>32;
-        return mask;
+    static inline __attribute__((always_inline)) uint64_t mask_for(uint64_t maximum) {
+        if (__builtin_expect(!maximum, 0)) return 0;
+        return ~UINT64_C(0) >> __builtin_clzll(maximum);
     }
-    uint64_t bounded_prepared(uint64_t maximum,uint64_t mask) {
+    inline __attribute__((always_inline)) uint64_t bounded_prepared(uint64_t maximum,uint64_t mask) {
         if (!maximum) return 0;
         uint64_t value;
         do {
@@ -65,11 +64,12 @@ public:
         } while (value>maximum);
         return value;
     }
-    uint64_t bounded(uint64_t upper) {
-        if (!upper) throw std::invalid_argument("zero random bound");
+    inline __attribute__((always_inline)) uint64_t bounded(uint64_t upper) {
+        if (__builtin_expect(upper==2, 1)) return word() & 1;
+        if (__builtin_expect(!upper, 0)) throw std::invalid_argument("zero random bound");
         return bounded_prepared(upper-1,mask_for(upper-1));
     }
-    double normal(double mean,double scale) {
+    inline __attribute__((always_inline)) double normal(double mean,double scale) {
         double gaussian;
         if (cached) { gaussian=spare; cached=false; spare=0; }
         else {
@@ -80,9 +80,9 @@ public:
         }
         return mean+scale*gaussian;
     }
-    double exponential(double scale=1) { return scale*(-std::log(1-uniform01())); }
-    double uniform(double low,double high) { return low+(high-low)*uniform01(); }
-    double lognormal(double mean,double scale) { return std::exp(normal(mean,scale)); }
-    double pareto(double alpha) { return std::exp(exponential()/alpha)-1; }
+    inline __attribute__((always_inline)) double exponential(double scale=1) { return scale*(-std::log(1-uniform01())); }
+    inline __attribute__((always_inline)) double uniform(double low,double high) { return low+(high-low)*uniform01(); }
+    inline __attribute__((always_inline)) double lognormal(double mean,double scale) { return std::exp(normal(mean,scale)); }
+    inline __attribute__((always_inline)) double pareto(double alpha) { return std::exp(exponential()/alpha)-1; }
 };
 }

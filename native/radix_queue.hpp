@@ -32,8 +32,12 @@ class RadixQueue {
         pending.clear();std::make_heap(buckets[0].begin(),buckets[0].end(),Tied{});
     }
 public:
-    bool empty() const {return count==0;}
-    void push(const CompactScheduled& event) {
+    RadixQueue() {
+        for(auto& b:buckets) b.reserve(64);
+        buckets[0].reserve(1024);
+    }
+    inline bool empty() const {return count==0;}
+    inline void push(const CompactScheduled& event) {
         uint64_t value=key(event.time);
         if(__builtin_expect(!general&&value<last, 0)) {
             for(auto& bucket:buckets) {for(const auto& old:bucket) fallback.push(old);bucket.clear();}
@@ -45,17 +49,31 @@ public:
         if(dest) occupied|=UINT64_C(1)<<(dest-1);
         else std::push_heap(bucket.begin(),bucket.end(),Tied{});
     }
-    const CompactScheduled& top() {
+    inline const CompactScheduled& top() {
         if(__builtin_expect(general, 0)) return fallback.top();
         prepare();
         return buckets[0].front();
     }
-    void pop() {
+    inline void pop() {
         --count;
         if(__builtin_expect(general, 0)) {fallback.pop();return;}
         auto& bucket=buckets[0];
         if(bucket.size()>1) std::pop_heap(bucket.begin(),bucket.end(),Tied{});
         bucket.pop_back();
+    }
+    inline void postpone_top(i64 new_time) {
+        if(__builtin_expect(general, 0)) {
+            CompactScheduled s=fallback.top();fallback.pop();
+            s.time=new_time;fallback.push(s);return;
+        }
+        auto& b0=buckets[0];
+        if(b0.size()>1) std::pop_heap(b0.begin(),b0.end(),Tied{});
+        CompactScheduled s=b0.back();b0.pop_back();
+        s.time=new_time;
+        unsigned dest=index(key(new_time)^last);
+        auto& bucket=buckets[dest];bucket.push_back(s);
+        if(dest) occupied|=UINT64_C(1)<<(dest-1);
+        else std::push_heap(bucket.begin(),bucket.end(),Tied{});
     }
 };
 }
