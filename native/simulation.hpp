@@ -32,11 +32,25 @@ class Oracle {
     i64 value,reference;
     double gamma,theta,rate,shock_mean,shock_time,shock_value,variance_coefficient;
     bool jump_pending=false;
+#ifdef T3_ORACLE_CACHE
+    bool coefficient_cached=false;
+    double cached_delta=0,cached_decay=0,cached_scale=0;
+#endif
     i64 jump_time=0,jump_value=0;
     i64 compute(OracleTime time,double adjustment) {
         double d=time.minus(previous);
+#ifdef T3_ORACLE_CACHE
+        if(!coefficient_cached||d!=cached_delta) {
+            cached_delta=d;cached_decay=std::exp(-gamma*d);
+            cached_scale=std::sqrt(variance_coefficient*(1-std::exp(-2*gamma*d)));
+            coefficient_cached=true;
+        }
+        double loc=reference+(value-reference)*cached_decay;
+        double scale=cached_scale;
+#else
         double loc=reference+(value-reference)*std::exp(-gamma*d);
         double scale=std::sqrt(variance_coefficient*(1-std::exp(-2*gamma*d)));
+#endif
         double v=rng.normal(loc,scale)+adjustment;
         value=rounded_integer(std::max(0.,v));
         if (jump_pending && (time.floating?time.real>=double(jump_time):time.integer>=jump_time)) {
@@ -156,10 +170,18 @@ class Simulation {
                 if (mid<fundamental-a.threshold&&ask) place(agent,size,0,ask);
                 else if (mid>fundamental+a.threshold&&bid) place(agent,size,1,bid);
             } else {
+#ifdef T3_MOMENTUM_RING
+                a.record_mid(mid);
+#else
                 a.mids.push_back(mid);
                 if (a.mids.size()>size_t(a.lookback+1)) a.mids.erase(a.mids.begin());
+#endif
                 if (a.mids.size()<=size_t(a.lookback)) return;
+#ifdef T3_MOMENTUM_RING
+                double past=a.mids[a.mids_head];
+#else
                 double past=a.mids.front();
+#endif
                 if (mid>past+a.threshold&&ask) place(agent,size,0,ask);
                 else if (mid<past-a.threshold&&bid) place(agent,size,1,bid);
             }

@@ -74,17 +74,20 @@ COPY scripts/build_lite.sh scripts/build_release.sh scripts/pgo_scenarios.py /tm
 ARG T3_BUILD_PGO=1
 RUN T3_BUILD_PGO=$T3_BUILD_PGO sh /tmp/build_release.sh
 
-FROM base AS final
+# Assemble one small runtime layer after compiling the static executable.
+FROM lite-compiler AS runtime-root
+COPY LICENSE THIRD_PARTY_NOTICES.md SOURCE_PROVENANCE.json /tmp/release-notices/
+COPY vendor/abides/LICENSE* /tmp/abides-licenses/
+COPY vendor/abides_fork/LICENSE /tmp/adapter-license
+COPY Dockerfile /tmp/release-Dockerfile
+COPY requirements.txt /tmp/release-requirements.txt
+COPY scripts/prepare_runtime.sh /tmp/prepare_runtime.sh
+RUN sh /tmp/prepare_runtime.sh
+
+FROM scratch AS final
+LABEL qfbench2.interface_version="2.0"
 ENV T3SIM_STREAM_LEDGER=1 T3SIM_STREAM_TRACE=auto T3SIM_LATENCY_PREFETCH=auto
-COPY --from=lite-compiler /opt/t3sim-cpp /opt/t3sim-cpp
-COPY --from=lite-compiler /usr/lib/x86_64-linux-gnu/libsnappy.so.1.2.2 /usr/lib/x86_64-linux-gnu/libsnappy.so.1
-COPY --from=lite-compiler /usr/share/doc/libsnappy1v5/copyright /opt/licenses/snappy/copyright
-COPY --from=lite-compiler /usr/share/doc/nlohmann-json3-dev/copyright /opt/licenses/nlohmann-json-copyright
-COPY scripts/entrypoint_cpp.sh /usr/local/bin/entrypoint
-COPY LICENSE THIRD_PARTY_NOTICES.md SOURCE_PROVENANCE.json /opt/licenses/
-COPY vendor/abides/LICENSE* /opt/licenses/abides/
-COPY vendor/abides_fork/LICENSE /opt/licenses/adapter/LICENSE
-RUN chmod +x /usr/local/bin/entrypoint
+COPY --from=runtime-root /tmp/runtime-root/ /
 WORKDIR /work
-ENTRYPOINT ["entrypoint"]
+ENTRYPOINT ["/opt/t3sim-cpp"]
 CMD ["--help"]

@@ -1,0 +1,44 @@
+# Packaging experiment: retain the validated executable and its exact libraries.
+ARG T3_RUNTIME_SOURCE=agenthon-t3:v5
+FROM ${T3_RUNTIME_SOURCE} AS runtime-source
+RUN set -eu; \
+    mkdir -p /runtime/opt /runtime/work /runtime/tmp; \
+    cp /opt/t3sim-cpp /runtime/opt/; \
+    cp -a /opt/licenses /runtime/opt/; \
+    ldd /opt/t3sim-cpp | awk '$2 == "=>" {print $3} $1 ~ /^\// {print $1}' | \
+      while read -r library; do \
+        mkdir -p "/runtime$(dirname "$library")"; \
+        cp -L "$library" "/runtime$library"; \
+      done; \
+    for package in libc6 libstdc++6 libgcc-s1 libssl3t64; do \
+      mkdir -p "/runtime/opt/licenses/$package"; \
+      cp "/usr/share/doc/$package/copyright" "/runtime/opt/licenses/$package/"; \
+    done; \
+    chmod 1777 /runtime/tmp
+
+FROM scratch AS native-runtime
+LABEL qfbench2.interface_version="2.0"
+ENV T3SIM_STREAM_LEDGER=1 T3SIM_STREAM_TRACE=auto T3SIM_LATENCY_PREFETCH=auto
+COPY --from=runtime-source /runtime/ /
+WORKDIR /work
+ENTRYPOINT ["/opt/t3sim-cpp"]
+CMD ["--help"]
+
+# The named candidate context contains only diagnostic ELF executables.
+FROM runtime-source AS static-root
+ARG T3_EXECUTABLE=static
+COPY --from=candidate / /tmp/candidates/
+RUN set -eu; \
+    mkdir -p /static-runtime/opt /static-runtime/work /static-runtime/tmp; \
+    cp "/tmp/candidates/$T3_EXECUTABLE" /static-runtime/opt/t3sim-cpp; \
+    chmod 755 /static-runtime/opt/t3sim-cpp; \
+    cp -a /runtime/opt/licenses /static-runtime/opt/; \
+    chmod 1777 /static-runtime/tmp
+
+FROM scratch AS static-runtime
+LABEL qfbench2.interface_version="2.0"
+ENV T3SIM_STREAM_LEDGER=1 T3SIM_STREAM_TRACE=auto T3SIM_LATENCY_PREFETCH=auto
+COPY --from=static-root /static-runtime/ /
+WORKDIR /work
+ENTRYPOINT ["/opt/t3sim-cpp"]
+CMD ["--help"]

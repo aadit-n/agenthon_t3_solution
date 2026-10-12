@@ -49,16 +49,18 @@ def cgroup_cpu(path):
     return {key: int(value) for key, value in (line.split() for line in path.read_text().splitlines())}
 
 
-def run_container(image, scenario_input, output, workers, timeout):
+def run_container(image, scenario_input, output, workers, timeout, diagnostics=None):
     output.mkdir(parents=True, exist_ok=True)
     tools = Path(__file__).resolve().parent
     name = "t3-performance-" + uuid.uuid4().hex
     batch = scenario_input.is_dir()
     command = ["docker", "create", "--name", name, "--network", "none", "--cpus", "4",
-               "--memory", "16g", "--memory-swap", "16g", "--entrypoint", "sh",
+               "--memory", "16g", "--memory-swap", "16g", "--entrypoint", "/tools/sh" if diagnostics else "sh",
                "-v", str(scenario_input.resolve()) + (":/input:ro" if batch else ":/input/scenario.json:ro"),
                "-v", str(output.resolve()) + ":/output",
                "-v", str(tools) + ":/bench:ro", image, "/bench/perf_measure.sh"]
+    if diagnostics:
+        command[2:2] = ["-v", str(diagnostics.resolve()) + ":/tools:ro", "-e", "PATH=/tools"]
     command += (["simulate-batch", "--batch-dir", "/input", "--out-dir", "/output", "--workers", str(workers)]
                 if batch else ["simulate", "--config", "/input/scenario.json", "--out", "/output/trace.parquet"])
     telemetry_dir = output.parent / (output.name + "-telemetry")
@@ -186,9 +188,9 @@ def write_report(report, folder):
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "performance.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf8")
     gpu = "GPU device attached" if report['environment']['gpu_attached_in_this_test'] else "no GPU attached"
-    text = ["This report measures the current simulator on the local machine. Rates count exchange events, delivered messages, or order commands; they are not HTTP request capacity. Every measured run includes container startup, simulation and output writing. The Development board uses a different, self-reported clock, shown separately.\n",
+    text = ["This report measures the current simulator on the local machine. Rates count exchange events, delivered messages, or order commands; they are not HTTP request capacity. The daemon start-to-exit clock includes startup, simulation and output writing. Current Development uses harness-verified counts over creation-to-removal time on a shared host; self-reported rates are diagnostic only.\n",
             f"Image: `{report['image_id']}`. Local CPU: {report['environment']['cpu_model']}. Limits: four CPUs, 16 GiB RAM, offline, {gpu}.\n",
-            f"Protocol: {report['runs']} measured runs after {report['warmups']} discarded warmups; byte-stable outputs and exact reference values required. Cgroup CPU and memory are collected with a small shell wrapper; its overhead remains included.\n",
+            f"Protocol: {report['runs']} measured runs after {report['warmups']} discarded warmups; byte-stable outputs and exact reference values required. Cgroup CPU and memory use a readonly-mounted diagnostic shell/cat; wrapper and mount overhead remains included. Diagnostic utilities are outside the submission image.\n",
             "| Workload | Workers | Events/s | Messages/s | Order commands/s | Job time (s) | Peak cgroup MiB | Avg CPU cores |",
             "|---|---:|---:|---:|---:|---:|---:|---:|"]
     for case in report["cases"]:
@@ -216,6 +218,7 @@ def main():
     parser.add_argument("--case", action="append", choices=[c[0] for c in DEFAULT_CASES])
     parser.add_argument("--leader-score", type=float, default=231024.2407)
     parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--diagnostics-image", default="agenthon-t3-build-lite:v4")
     args = parser.parse_args()
     if args.runs < 1 or args.warmups < 0:
         parser.error("--runs must be positive and --warmups nonnegative")
@@ -223,13 +226,25 @@ def main():
         parser.error("--leader-score must be positive and finite; --timeout must be positive")
     info = json_command(["docker", "image", "inspect", args.image])[0]
     image_id = info["Id"]
+    diagnostic_id = json_command(["docker", "image", "inspect", args.diagnostics_image])[0]['Id']
+    diagnostics = args.output_dir.resolve() / 'diagnostic-tools'
+    diagnostics.mkdir(parents=True, exist_ok=True)
+    helper = 't3-perf-tools-' + uuid.uuid4().hex
+    subprocess.run(['docker', 'create', '--name', helper, '--network', 'none', diagnostic_id], check=True, capture_output=True)
+    try:
+        for source, name in (('/bin/dash', 'sh'), ('/usr/bin/cat', 'cat')):
+            subprocess.run(['docker', 'cp', helper + ':' + source, str(diagnostics / name)], check=True, capture_output=True)
+    finally:
+        subprocess.run(['docker', 'rm', helper], check=True, capture_output=True)
     env = json_command(["docker", "run", "--rm", "--network", "none", "--cpus", "4", "--memory", "16g",
-                        "--entrypoint", "python", "-v", str(root / "scripts") + ":/bench:ro", image_id,
+                        "--entrypoint", "python", "-v", str(root / "scripts") + ":/bench:ro", diagnostic_id,
                         "/bench/perf_environment.py"])
     report = {"rankable": False, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
               "image_id": image_id, "image_label": args.image, "runs": args.runs, "warmups": args.warmups,
               "leader_score": args.leader_score, "leader_url": "https://www.agenthon.net/",
               "environment": env, "prior_public_roster": prior_roster(args.public_results), "cases": []}
+    report['diagnostics_image_id'] = diagnostic_id
+    report['diagnostic_tool_sha256'] = {p.name: sha256(p) for p in diagnostics.iterdir()}
     batch_binding = None
     for label, slug, workers in DEFAULT_CASES:
         if args.case and label not in args.case:
@@ -240,7 +255,7 @@ def main():
         for repeat in range(args.warmups + args.runs):
             output = args.output_dir / label / str(repeat) / "output"
             measured = run_container(image_id, unit / "scenarios" if workers else unit / "scenario.json",
-                                     output, workers, args.timeout)
+                                     output, workers, args.timeout, diagnostics)
             inspected = inspect_outputs(output, unit, bool(workers), repeat == 0)
             binding = inspected.pop("binding")
             if previous_binding is not None and binding != previous_binding:

@@ -15,11 +15,18 @@ class PooledBook {
     PriceLevel* best[2]={nullptr,nullptr};
     i64 price[2]={0,0};
 #ifdef T3_PRICE_CACHE
+    static constexpr size_t CACHE_SIZE=size_t(1)<<
+#ifdef T3_PRICE_CACHE_BITS
+        T3_PRICE_CACHE_BITS;
+    static_assert(T3_PRICE_CACHE_BITS>=6&&T3_PRICE_CACHE_BITS<=16,"bounded price cache");
+#else
+        8;
+#endif
     struct Cached {i64 price=0;PriceLevel* level=nullptr;};
-    Cached cache[2][256];
+    Cached cache[2][CACHE_SIZE];
     std::map<i64,PriceLevel>::iterator best_position[2];
     PriceLevel& level_for(int side,i64 value) {
-        auto& hit=cache[side][uint64_t(value)&255];
+        auto& hit=cache[side][uint64_t(value)&(CACHE_SIZE-1)];
         if(hit.level&&hit.price==value) return *hit.level;
         auto& level=levels[side][value];hit={value,&level};return level;
     }
@@ -39,7 +46,7 @@ class PooledBook {
         by_id[size_t(node.order.id)]=NONE;node.level=nullptr;free.push_back(slot);
         if(level->head==NONE) {
 #ifdef T3_PRICE_CACHE
-            auto& hit=cache[side][uint64_t(node.order.price)&255];
+            auto& hit=cache[side][uint64_t(node.order.price)&(CACHE_SIZE-1)];
             if(hit.level==level) hit.level=nullptr;
             if(level==best[side]) {levels[side].erase(best_position[side]);refresh(side);}
             else levels[side].erase(node.order.price);

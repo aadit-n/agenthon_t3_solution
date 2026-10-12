@@ -2,7 +2,11 @@
 # Local diagnostic wrapper. The unchanged submission entrypoint performs the run.
 # Cgroup statistics cover every worker and include the small wrapper overhead.
 cat /sys/fs/cgroup/cpu.stat > /tmp/t3_cpu_before 2>/dev/null || true
-entrypoint "$@"
+if [ -x /opt/t3sim-cpp ]; then
+    /opt/t3sim-cpp "$@"
+else
+    entrypoint "$@"
+fi
 simulation_status=$?
 cat /sys/fs/cgroup/cpu.stat > /tmp/t3_cpu_after 2>/dev/null || true
 if [ -r /sys/fs/cgroup/memory.peak ]; then

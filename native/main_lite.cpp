@@ -38,7 +38,12 @@ public:
                     auto compare=[](const TraceRow& a,const TraceRow& b){return std::tie(a.time,a.order_id,a.agent,a.rank)<std::tie(b.time,b.order_id,b.agent,b.rank);};
                     for(size_t begin=0;begin<block.size();) {
                         size_t end=begin+1;while(end<block.size()&&block[end].time==block[begin].time) ++end;
-                        if(end-begin>1) std::sort(block.begin()+begin,block.begin()+end,compare);begin=end;
+#ifdef T3_FAST_TRACE_SORT
+                        sort_trace_group(block,begin,end);
+#else
+                        if(end-begin>1) std::sort(block.begin()+begin,block.begin()+end,compare);
+#endif
+                        begin=end;
                     }
                     writer.append_trace(block,0,block.size());
                 } else litepq::ledger_block(writer,block,first);
@@ -142,7 +147,7 @@ void random_test(const fs::path& config,const fs::path& out) {
 int main(int argc,char** argv) {
     Time start=Clock::now();
     try {
-        if(argc<2||std::string(argv[1])=="--help") {std::cout<<"Agenthon T3 native simulator v5\nsimulate --config FILE --out FILE [--seed N]\nsimulate-batch --batch-dir DIR --out-dir DIR [--workers 1..4]\n";return 0;}
+        if(argc<2||std::string(argv[1])=="--help") {std::cout<<"Agenthon T3 native simulator v7\nsimulate --config FILE --out FILE [--seed N]\nsimulate-batch --batch-dir DIR --out-dir DIR [--workers 1..4]\n";return 0;}
         std::map<std::string,std::string> args;for(int i=2;i<argc;i+=2) {if(i+1>=argc) throw std::invalid_argument("missing option value");args[argv[i]]=argv[i+1];}
         std::string command=argv[1];Json result;
         if(command=="simulate") {

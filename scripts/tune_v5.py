@@ -8,6 +8,7 @@ import shutil
 import statistics
 import subprocess
 import time
+import uuid
 
 
 def main():
@@ -20,28 +21,53 @@ def main():
     ap.add_argument('--all-units', action='store_true')
     args = ap.parse_args()
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    variants = dict(v.split('=', 1) for v in args.variant)
+    sources = dict(v.split('=', 1) for v in args.variant)
+    work = Path('/tmp') / ('t3-native-trials-' + uuid.uuid4().hex)
+    binaries = work / 'binaries'
+    inputs = work / 'input'
+    binaries.mkdir(parents=True)
+    inputs.mkdir()
+    variants = {}
+    for index, (name, source) in enumerate(sources.items()):
+        executable = binaries / str(index)
+        shutil.copyfile(source, executable)
+        executable.chmod(0o755)
+        if hashlib.sha256(executable.read_bytes()).digest() != hashlib.sha256(Path(source).read_bytes()).digest():
+            raise RuntimeError('Executable copy differs from source')
+        variants[name] = str(executable)
+    for unit in Path('/input').iterdir():
+        if not unit.is_dir():
+            continue
+        target = inputs / unit.name
+        target.mkdir()
+        if (unit / 'batch.json').exists():
+            (target / 'batch.json').write_text('{}\n')
+            (target / 'scenarios').mkdir()
+            for scenario in (unit / 'scenarios').glob('*.json'):
+                shutil.copyfile(scenario, target / 'scenarios' / scenario.name)
+        else:
+            shutil.copyfile(unit / 'scenario.json', target / 'scenario.json')
     environments = {n: {} for n in variants}
     for item in args.env:
         name, value = item.split(':', 1)
         key, value = value.split('=', 1)
         environments[name][key] = value
     report = {'protocol': 'rotated/reversed sequential fresh processes; one warmup; startup, simulation, file closure and hashing timed; artifact copying outside timing',
-              'storage': 'Linux container filesystem', 'runs': args.runs,
+              'storage': 'Executables, configuration inputs and output on Linux container filesystem', 'runs': args.runs,
               'cpu_affinity': sorted(os.sched_getaffinity(0)),
               'cpu_max': Path('/sys/fs/cgroup/cpu.max').read_text().strip(),
               'memory_max': Path('/sys/fs/cgroup/memory.max').read_text().strip(),
               'binaries': {n: hashlib.sha256(Path(p).read_bytes()).hexdigest() for n, p in variants.items()}, 'environments': environments, 'units': []}
-    units = sorted(p.name for p in Path('/input').iterdir() if p.is_dir()) if args.all_units else args.unit or ['t3-as01-base-mix', 't3-gb-base-30agent-30s', 't3-gb-mega-throughput', 't3-gbatch-homog-8', 't3-mr-deep-book-state-size']
+    units = sorted(p.name for p in inputs.iterdir() if p.is_dir()) if args.all_units else args.unit or ['t3-as01-base-mix', 't3-as03-mm-liquidity-heavy', 't3-as04-value-heavy', 't3-gb-base-30agent-30s', 't3-gb-mega-throughput', 't3-gbatch-homog-8', 't3-mr-deep-book-state-size']
     for slug in units:
-        unit = Path('/input') / slug
+        unit = inputs / slug
         batch = (unit / 'batch.json').exists()
         trials = {n: [] for n in variants}
         stable = {}
         for repeat in range(args.runs + 1):
             names = list(variants)
             names = names[repeat % len(names):] + names[:repeat % len(names)]
-            if repeat % 2:
+            if (repeat // len(names)) % 2:
                 names.reverse()
             for name in names:
                 out = Path('/tmp/v5-trials') / slug / name

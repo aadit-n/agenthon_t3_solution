@@ -146,12 +146,32 @@ struct CompactScheduled {
 #endif
 struct TraceRow {
     i64 time, price, size, order_id, rank;
+#ifdef T3_COMPACT_TRACE
+    int agent;
+    uint8_t kind,side;
+    TraceRow()=default;
+    TraceRow(i64 t,i64 p,i64 s,i64 o,i64 r,int a,int k,int direction):
+        time(t),price(p),size(s),order_id(o),rank(r),agent(a),kind(uint8_t(k)),side(uint8_t(direction)) {}
+#else
     int agent, kind, side;
+#endif
 };
+#ifdef T3_COMPACT_TRACE
+static_assert(sizeof(TraceRow)==48,"compact trace row layout");
+#endif
 struct LedgerRow {
     i64 id, send, recv, latency, parent, order_id;
     int src, dst, kind;
 };
+#ifdef T3_FAST_TRACE_SORT
+inline void sort_trace_group(std::vector<TraceRow>& rows,size_t begin,size_t end) {
+    if(end-begin<2) return;
+    auto compare=[](const TraceRow& a,const TraceRow& b) {return std::tie(a.order_id,a.agent,a.rank)<std::tie(b.order_id,b.agent,b.rank);};
+    auto first=rows.begin()+begin,last=rows.begin()+end;
+    if(end-begin==2) {if(compare(first[1],first[0])) std::iter_swap(first,first+1);}
+    else if(!std::is_sorted(first,last,compare)) std::sort(first,last,compare);
+}
+#endif
 }
 #include "open_orders.hpp"
 namespace t3 {
@@ -161,12 +181,22 @@ struct AgentState {
     double mean=0, stddev=0, sigma_n=0;
     uint64_t offset_mask=0;
     bool first=true, hours=false, closed=false, awaiting=false, log_orders=true;
-#ifdef T3_FLAT_OPEN
+#ifdef T3_TOMBSTONE_OPEN
+    TombstoneOpenOrders open;
+#elif defined(T3_FLAT_OPEN)
     FlatOpenOrders open;
 #else
     std::map<i64,Order> open;
 #endif
     std::vector<double> mids;
+#ifdef T3_MOMENTUM_RING
+    size_t mids_head=0;
+    void record_mid(double mid) {
+        if(mids.size()==size_t(lookback)+1) {
+            mids[mids_head]=mid;if(++mids_head==mids.size()) mids_head=0;
+        } else mids.push_back(mid);
+    }
+#endif
 };
 struct Level { std::list<i64> fifo; i64 quantity=0; };
 struct Resting { Order order; std::list<i64>::iterator position; };
@@ -236,8 +266,11 @@ public:
 #include "radix_queue.hpp"
 #include "recipient_queue.hpp"
 #include "message_pool.hpp"
+#include "flat_price_book.hpp"
 namespace t3 {
-#ifdef T3_POOL_BOOK
+#ifdef T3_FLAT_PRICE_BOOK
+using Book=FlatPriceBook;
+#elif defined(T3_POOL_BOOK)
 using Book=PooledBook;
 #else
 using Book=LegacyBook;
@@ -275,6 +308,9 @@ public:
     i64 total_messages=0;
     Book book;
     i64 now=0, stop=0, open=0, close=0, next_msg=1, next_order=0, causal=-1;
+#ifdef T3_FAST_TRACE_SORT
+    bool trace_monotone=true;
+#endif
     i64 ack_delay=0, compute_delay=0;
     int stp=0;
     i64 quote_time[2]={-1,-1};
@@ -316,7 +352,11 @@ public:
 #ifdef T3_RECIPIENT_QUEUE
         queue.before_pop(stop);
 #endif
-        CompactScheduled s=queue.top();queue.pop();trace_boundary(s.time);now=s.time;
+        CompactScheduled s=queue.top();queue.pop();
+#ifdef T3_FAST_TRACE_SORT
+        if(s.time<now) trace_monotone=false;
+#endif
+        trace_boundary(s.time);now=s.time;
 #ifdef T3_REF_MESSAGES
         if(held_message!=UINT32_MAX) free_slots.push_back(held_message);
         held_message=s.slot;return messages[s.slot];
@@ -394,7 +434,11 @@ public:
 #ifdef T3_STANDALONE
         const char* option=std::getenv("T3SIM_FULL_SORT");
         bool full=option&&std::strcmp(option,"1")==0;
+#ifdef T3_FAST_TRACE_SORT
+        if(!trace_monotone) full=true;
+#else
         if (!full&&!std::is_sorted(trace.begin(),trace.end(),[](const TraceRow& a,const TraceRow& b){return a.time<b.time;})) full=true;
+#endif
         auto compare=[](const TraceRow& a,const TraceRow& b) {
             return std::tie(a.time,a.order_id,a.agent,a.rank)<std::tie(b.time,b.order_id,b.agent,b.rank);
         };
@@ -404,7 +448,11 @@ public:
             // runs need canonical order-ID/agent/stable-rank sorting.
             for (size_t first=0;first<trace.size();) {
                 size_t last=first+1;while (last<trace.size()&&trace[last].time==trace[first].time) ++last;
+#ifdef T3_FAST_TRACE_SORT
+                sort_trace_group(trace,first,last);
+#else
                 if (last-first>1) std::sort(trace.begin()+first,trace.begin()+last,compare);
+#endif
                 first=last;
             }
         }
