@@ -23,6 +23,10 @@ int64_t peak_memory() {rusage usage{};getrusage(RUSAGE_SELF,&usage);return int64
 template<class Row,bool TRACE=false> class FileStream {
     std::mutex mutex;std::condition_variable ready;
     std::deque<std::vector<Row>> pending;
+#ifdef T3_REUSE_ROW_BUFFERS
+    std::deque<std::vector<Row>> spare;
+    size_t allocated=1;
+#endif
     bool ended=false;std::exception_ptr failure;
     std::string hash;double encoding=0;std::thread thread;
 public:
@@ -48,16 +52,33 @@ public:
                     writer.append_trace(block,0,block.size());
                 } else litepq::ledger_block(writer,block,first);
                 encoding+=seconds(start);first+=block.size();
+#ifdef T3_REUSE_ROW_BUFFERS
+                block.clear();
+                {std::lock_guard<std::mutex> lock(mutex);spare.push_back(std::move(block));}
+                ready.notify_all();
+#endif
             }
             Time start=Clock::now();hash=writer.close();encoding+=seconds(start);
         } catch(...) {std::lock_guard<std::mutex> lock(mutex);failure=std::current_exception();ready.notify_all();}
     }) {}
     ~FileStream() {if(thread.joinable()) {{std::lock_guard<std::mutex> lock(mutex);ended=true;}ready.notify_all();thread.join();}}
+#ifdef T3_REUSE_ROW_BUFFERS
+    std::vector<Row> submit(std::vector<Row>&& block) {
+        if(block.empty()) return std::move(block);
+        std::unique_lock<std::mutex> lock(mutex);
+        ready.wait(lock,[&]{return pending.size()<2||failure;});if(failure) std::rethrow_exception(failure);
+        pending.push_back(std::move(block));ready.notify_all();
+        if(spare.empty()&&allocated<4) {++allocated;return {};}
+        ready.wait(lock,[&]{return !spare.empty()||failure;});if(failure) std::rethrow_exception(failure);
+        auto result=std::move(spare.front());spare.pop_front();return result;
+    }
+#else
     void submit(std::vector<Row>&& block) {
         if(block.empty()) return;std::unique_lock<std::mutex> lock(mutex);
         ready.wait(lock,[&]{return pending.size()<2||failure;});if(failure) std::rethrow_exception(failure);
         pending.push_back(std::move(block));ready.notify_all();
     }
+#endif
     std::pair<std::string,double> finish() {
         {std::lock_guard<std::mutex> lock(mutex);ended=true;}ready.notify_all();thread.join();if(failure) std::rethrow_exception(failure);
         return {hash,encoding};
@@ -74,8 +95,8 @@ Json simulate(const fs::path& config,const fs::path& out,std::optional<uint32_t>
     std::string trace_mode=env("T3SIM_STREAM_TRACE","0");
     if(concurrent&&(trace_mode=="1"||(trace_mode=="auto"&&expected_trace>=262144))) {
         LedgerStream messages(parent/"message_trace.parquet");TraceStream trace(out);
-        simulation.c.ledger_sink=[&](std::vector<LedgerRow>&& rows){messages.submit(std::move(rows));};
-        simulation.c.trace_sink=[&](std::vector<TraceRow>&& rows){trace.submit(std::move(rows));};
+        simulation.c.ledger_sink=[&](std::vector<LedgerRow>&& rows){return messages.submit(std::move(rows));};
+        simulation.c.trace_sink=[&](std::vector<TraceRow>&& rows){return trace.submit(std::move(rows));};
         std::vector<LedgerRow>().swap(simulation.c.ledger);simulation.c.ledger.reserve(65536);
         std::vector<TraceRow>().swap(simulation.c.trace);simulation.c.trace.reserve(16384);
         double config_sec=seconds(start);Time phase=Clock::now();simulation.run();simulation.stop_latency();double loop_sec=seconds(phase);
@@ -90,7 +111,7 @@ Json simulate(const fs::path& config,const fs::path& out,std::optional<uint32_t>
         write_json(parent/"events.json",result);return result;
     }
     if(concurrent&&env("T3SIM_STREAM_LEDGER","0")=="1") {
-        LedgerStream messages(parent/"message_trace.parquet");simulation.c.ledger_sink=[&](std::vector<LedgerRow>&& rows){messages.submit(std::move(rows));};
+        LedgerStream messages(parent/"message_trace.parquet");simulation.c.ledger_sink=[&](std::vector<LedgerRow>&& rows){return messages.submit(std::move(rows));};
         std::vector<LedgerRow>().swap(simulation.c.ledger);simulation.c.ledger.reserve(65536);
         double config_sec=seconds(start);Time phase=Clock::now();simulation.run();simulation.stop_latency();double loop_sec=seconds(phase);
         simulation.c.ledger_sink={};messages.submit(std::move(simulation.c.ledger));

@@ -264,6 +264,7 @@ public:
 #include "pooled_book.hpp"
 #include "event_heap.hpp"
 #include "radix_queue.hpp"
+#include "narrow_radix_queue.hpp"
 #include "recipient_queue.hpp"
 #include "message_pool.hpp"
 #include "flat_price_book.hpp"
@@ -280,6 +281,8 @@ public:
 #ifdef T3_STANDALONE
 #ifdef T3_RECIPIENT_QUEUE
     RecipientQueue queue;
+#elif defined(T3_NARROW_SCHEDULED)
+    NarrowRadixQueue queue;
 #elif defined(T3_RADIX_QUEUE)
     RadixQueue queue;
 #elif defined(T3_FOUR_HEAP)
@@ -301,10 +304,18 @@ public:
     std::vector<AgentState> agents;
     std::vector<int> subscriptions;
     std::vector<TraceRow> trace;
+#ifdef T3_REUSE_ROW_BUFFERS
+    std::function<std::vector<TraceRow>(std::vector<TraceRow>&&)> trace_sink;
+#else
     std::function<void(std::vector<TraceRow>&&)> trace_sink;
+#endif
     i64 trace_base=0;
     std::vector<LedgerRow> ledger;
+#ifdef T3_REUSE_ROW_BUFFERS
+    std::function<std::vector<LedgerRow>(std::vector<LedgerRow>&&)> ledger_sink;
+#else
     std::function<void(std::vector<LedgerRow>&&)> ledger_sink;
+#endif
     i64 total_messages=0;
     Book book;
     i64 now=0, stop=0, open=0, close=0, next_msg=1, next_order=0, causal=-1;
@@ -333,14 +344,24 @@ public:
         ledger.push_back(LedgerRow{m.id,m.send,m.recv,m.delivery_latency(),m.parent,m.order.id,m.src,m.dst,m.kind});
         ++total_messages;
         if(ledger_sink&&ledger.size()==65536) {
-            ledger_sink(std::move(ledger));ledger=std::vector<LedgerRow>();ledger.reserve(65536);
+#ifdef T3_REUSE_ROW_BUFFERS
+            ledger=ledger_sink(std::move(ledger));
+#else
+            ledger_sink(std::move(ledger));ledger=std::vector<LedgerRow>();
+#endif
+            ledger.reserve(65536);
         }
     }
     bool empty() const { return queue.empty(); }
     void trace_boundary(i64 next_time) {
         if(trace_sink&&next_time!=now&&trace.size()>=16384) {
-            i64 count=trace.size();trace_sink(std::move(trace));trace_base+=count;
+            i64 count=trace.size();
+#ifdef T3_REUSE_ROW_BUFFERS
+            trace=trace_sink(std::move(trace));trace_base+=count;trace.reserve(16384);
+#else
+            trace_sink(std::move(trace));trace_base+=count;
             trace=std::vector<TraceRow>();trace.reserve(16384);
+#endif
         }
     }
 #ifdef T3_REF_MESSAGES

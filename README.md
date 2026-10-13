@@ -4,6 +4,10 @@ The audited runtime is 13.5 MiB versus 179.2 MiB for v5. Seven repeated Linux pr
 
 The [v7 report](results/v7-optimization/REPORT.md) records exact image identity, validation, measurements and limitations. [HOW_IT_WORKS.md](HOW_IT_WORKS.md) explains the original architecture; [RESEARCH.md](RESEARCH.md) records alternatives. [The archived v5 guide](results/v7-tuning/README-v5.md) remains available.
 
+The user subsequently reported approximately 199k for v7. The next [execution optimization experiment](EXECUTION_OPTIMIZATION.md) implements C++ configuration specialization, checked compact scheduler storage and bounded row-buffer reuse. The separately validated `agenthon-t3:v8-candidate` selects latency/protocol specialization; its [report](results/execution-specialization/REPORT.md) records 3.1–4.4% native gains across all 71 workloads and only 0.9% in a seven-workload complete CLI lifecycle comparison. V7 remains the default pending stronger evidence. These measurements do not establish a Codabench improvement or beating 231k.
+
+To explicitly rebuild the selected specialization candidate, use `docker build --platform linux/amd64 --build-arg "T3_EXTRA_CXX_FLAGS=-DT3_SPECIALIZE_LATENCY -DT3_SPECIALIZE_PROTOCOL" --build-arg T3_SPECIALIZED_PGO=1 -t agenthon-t3:v8-candidate .`. The supplied local candidate contains the exact measured executable and its matching rebuild-source snapshot. Later compact-queue and row-reuse experiments remain disabled in that image and in the default build.
+
 ## Build and run
 
 Use Docker Desktop in Linux-container mode and PowerShell:

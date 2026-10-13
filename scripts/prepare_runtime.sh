@@ -25,7 +25,7 @@ chmod 1777 "$root/tmp"
 # No compiler, generated training inputs, profiles or reference outputs ship.
 mkdir -p "$root/opt/relink/native" "$root/opt/relink/scripts"
 cp /opt/native/* "$root/opt/relink/native/"
-cp /tmp/build_lite.sh /tmp/build_release.sh /tmp/pgo_scenarios.py "$root/opt/relink/scripts/"
+cp /tmp/build_lite.sh /tmp/build_release.sh /tmp/pgo_scenarios.py /tmp/pgo_specialized.py "$root/opt/relink/scripts/"
 cp /tmp/release-Dockerfile /tmp/release-requirements.txt "$root/opt/relink/"
 mv "$root/opt/relink/release-Dockerfile" "$root/opt/relink/Dockerfile"
 mv "$root/opt/relink/release-requirements.txt" "$root/opt/relink/requirements.txt"

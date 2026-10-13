@@ -12,6 +12,13 @@ namespace t3 {
 using Json=nlohmann::json;
 constexpr i64 DATE=1612483200000000000LL;
 
+// A run selects immutable configuration properties once. The generic mode
+// remains available for controls and uncommon combinations (action prefetch).
+template<int LATENCY=-1,bool PLAIN_PROTOCOL=false> struct ExecutionMode {
+    static constexpr int latency=LATENCY;
+    static constexpr bool plain_protocol=PLAIN_PROTOCOL;
+};
+
 // The reference mixes integer and floating timestamps around Poisson shocks.
 // Keep that distinction: converting every timestamp to double loses nanoseconds.
 struct OracleTime {
@@ -118,48 +125,56 @@ class Simulation {
 #endif
         return {size,offset,buy};
     }
-    i64 sampled_latency() {
-        double v=latency_kind==1?latency_rng.uniform(latency_min,latency_max):
-                 latency_kind==2?latency_rng.lognormal(latency_mu,latency_sigma):
+    template<int KIND=-1> i64 sampled_latency() {
+        constexpr bool generic=KIND==-1;
+        double v=(generic?latency_kind:KIND)==1?latency_rng.uniform(latency_min,latency_max):
+                 (generic?latency_kind:KIND)==2?latency_rng.lognormal(latency_mu,latency_sigma):
                  (latency_min>0?latency_min:1)*(1+latency_rng.pareto(latency_alpha));
         return rounded_integer(std::max(latency_min,std::min(latency_max,v)));
     }
-    i64 latency_for(int sender,int recipient) {
+    template<class Mode> i64 latency_for(int sender,int recipient) {
         if (sender==recipient) return 0;
-        if (latency_kind==4) return fixed_latency;
-        if (latency_kind==0) {
+        if constexpr(Mode::latency==4) return fixed_latency;
+        else if constexpr(Mode::latency==5) return latency_stream->next();
+        else if constexpr(Mode::latency>=1&&Mode::latency<=3) return sampled_latency<Mode::latency>();
+        else {
+        if constexpr(Mode::latency==-1) {if (latency_kind==4) return fixed_latency;}
+        if (Mode::latency==0||latency_kind==0) {
             if(sender==0||recipient==0) return exchange_latencies[sender==0?recipient:sender];
             double distance=locations[sender]-locations[recipient];
             return i64(std::sqrt(distance*distance)/0.299792458);
         }
         return action_latency?action_stream->next_latency():latency_stream?latency_stream->next():sampled_latency();
+        }
     }
-    void send(int sender,int recipient,Msg msg) {
+    template<class Mode> void send(int sender,int recipient,Msg msg) {
         msg.src=sender;msg.dst=recipient;msg.parent=c.causal;
         msg.send=c.now+c.agents[sender].delay;
-        if (sender==0&&(msg.kind==ACCEPTED||msg.kind==EXECUTED||msg.kind==CANCELLED)) msg.send+=c.ack_delay;
-        msg.arrive(latency_for(sender,recipient));c.enqueue(msg);
+        if constexpr(!Mode::plain_protocol) {
+            if (sender==0&&(msg.kind==ACCEPTED||msg.kind==EXECUTED||msg.kind==CANCELLED)) msg.send+=c.ack_delay;
+        }
+        msg.arrive(latency_for<Mode>(sender,recipient));c.enqueue(msg);
     }
-    void simple(int sender,int recipient,int kind) { send(sender,recipient,c.make(kind)); }
-    void order_message(int sender,int kind,const Order& order) {
-        Msg msg=c.make(kind);msg.order=order;send(sender,sender?0:order.agent,msg);
+    template<class Mode> void simple(int sender,int recipient,int kind) { send<Mode>(sender,recipient,c.make(kind)); }
+    template<class Mode> void order_message(int sender,int kind,const Order& order) {
+        Msg msg=c.make(kind);msg.order=order;send<Mode>(sender,sender?0:order.agent,msg);
     }
-    void place(int agent,i64 size,int side,i64 price) {
+    template<class Mode> void place(int agent,i64 size,int side,i64 price) {
         Order o;o.id=c.next_order++;o.agent=agent;o.quantity=size;o.side=side;o.price=price;
-        c.remember(agent,o);order_message(agent,LIMIT,o);c.log(agent,SUBMITTED,o);
+        c.remember(agent,o);order_message<Mode>(agent,LIMIT,o);c.log(agent,SUBMITTED,o);
     }
-    void act(int agent,i64 bid,i64 ask) {
+    template<class Mode> void act(int agent,i64 bid,i64 ask) {
         auto& a=c.agents[agent];
         if (a.type==1) {
             NoiseAction action=action_stream?action_stream->next_noise(agent):noise_action(agent);
             i64 size=action.size,offset=action.offset;int buy=action.buy;
             i64 anchor=buy?(ask?ask:(bid?bid:a.reference)):(bid?bid:(ask?ask:a.reference));
-            place(agent,size,buy?0:1,buy?anchor+offset:anchor-offset);
+            place<Mode>(agent,size,buy?0:1,buy?anchor+offset:anchor-offset);
         } else if (a.type==2) {
             i64 mid=bid&&ask?(bid+ask)/2:a.reference;
-            for (const auto& item:a.open) order_message(agent,CANCEL,item.second);
+            for (const auto& item:a.open) order_message<Mode>(agent,CANCEL,item.second);
             for (int level=0;level<a.depth;++level) {
-                place(agent,a.size,0,mid-a.spread/2-level);place(agent,a.size,1,mid+a.spread/2+level);
+                place<Mode>(agent,a.size,0,mid-a.spread/2-level);place<Mode>(agent,a.size,1,mid+a.spread/2+level);
             }
         } else {
             if (!bid&&!ask) return;
@@ -167,8 +182,8 @@ class Simulation {
             i64 size=std::max<i64>(1,rounded_integer(a.mean));
             if (a.type==3) {
                 i64 fundamental=oracle.observe(c.now,rngs[agent],a.sigma_n);
-                if (mid<fundamental-a.threshold&&ask) place(agent,size,0,ask);
-                else if (mid>fundamental+a.threshold&&bid) place(agent,size,1,bid);
+                if (mid<fundamental-a.threshold&&ask) place<Mode>(agent,size,0,ask);
+                else if (mid>fundamental+a.threshold&&bid) place<Mode>(agent,size,1,bid);
             } else {
 #ifdef T3_MOMENTUM_RING
                 a.record_mid(mid);
@@ -182,44 +197,52 @@ class Simulation {
 #else
                 double past=a.mids.front();
 #endif
-                if (mid>past+a.threshold&&ask) place(agent,size,0,ask);
-                else if (mid<past-a.threshold&&bid) place(agent,size,1,bid);
+                if (mid>past+a.threshold&&ask) place<Mode>(agent,size,0,ask);
+                else if (mid<past-a.threshold&&bid) place<Mode>(agent,size,1,bid);
             }
         }
     }
-    void limit(Order order) {
+    template<class Mode> void limit(Order order) {
         if (order.quantity<=0||order.price<0) return;
         while (true) {
             if (c.book.cross(order)) {
-                Order resting=c.book.front(order.side);
-                if (c.stp&&resting.agent==order.agent) {
-                    if (c.stp==1) { resting=c.book.cancel(resting);order_message(0,CANCELLED,resting);continue; }
-                    order_message(0,CANCELLED,order);break;
+                if constexpr(!Mode::plain_protocol) {
+#ifdef T3_LAZY_STP_FRONT
+                if(c.stp) {
+#endif
+                    Order resting=c.book.front(order.side);
+                    if (c.stp&&resting.agent==order.agent) {
+                        if (c.stp==1) { resting=c.book.cancel(resting);order_message<Mode>(0,CANCELLED,resting);continue; }
+                        order_message<Mode>(0,CANCELLED,order);break;
+                    }
+#ifdef T3_LAZY_STP_FRONT
                 }
-                resting=c.book.take(order.side,order.quantity);
+#endif
+                }
+                Order resting=c.book.take(order.side,order.quantity);
                 Order filled=order;filled.quantity=resting.quantity;filled.fill_price=resting.fill_price;
-                order.quantity-=filled.quantity;order_message(0,EXECUTED,resting);order_message(0,EXECUTED,filled);
+                order.quantity-=filled.quantity;order_message<Mode>(0,EXECUTED,resting);order_message<Mode>(0,EXECUTED,filled);
                 if (!order.quantity) break;
-            } else { c.book.enter(order);order_message(0,ACCEPTED,order);break; }
+            } else { c.book.enter(order);order_message<Mode>(0,ACCEPTED,order);break; }
         }
         c.quotes();
     }
-    void exchange(const Msg& msg) {
+    template<class Mode> void exchange(const Msg& msg) {
         c.agents[0].delay=c.compute_delay;
-        if (c.now>c.close&&msg.kind!=QUERY) { simple(0,msg.src,CLOSED);return; }
+        if (c.now>c.close&&msg.kind!=QUERY) { simple<Mode>(0,msg.src,CLOSED);return; }
         switch (msg.kind) {
-        case HOURS_REQ:c.agents[0].delay=0;simple(0,msg.src,HOURS);break;
+        case HOURS_REQ:c.agents[0].delay=0;simple<Mode>(0,msg.src,HOURS);break;
         case CLOSE_REQ:c.subscriptions.push_back(msg.src);break;
         case QUERY: {
             Msg response=c.make(SPREAD);response.spread(c.book.best_price(0),c.book.best_price(1),c.now>c.close);
-            send(0,msg.src,response);break;
+            send<Mode>(0,msg.src,response);break;
         }
-        case LIMIT:limit(msg.order);break;
-        case CANCEL: { Order o=c.book.cancel(msg.order);if (o.id>=0) order_message(0,CANCELLED,o);break; }
+        case LIMIT:limit<Mode>(msg.order);break;
+        case CANCEL: { Order o=c.book.cancel(msg.order);if (o.id>=0) order_message<Mode>(0,CANCELLED,o);break; }
         default:throw std::runtime_error("unexpected exchange message");
         }
     }
-    void receive(const Msg& msg) {
+    template<class Mode> void receive(const Msg& msg) {
         auto& a=c.agents[msg.dst];
         switch (msg.kind) {
         case HOURS:
@@ -230,7 +253,7 @@ class Simulation {
         case CANCELLED:c.log(msg.dst,CANCEL_EVENT,msg.order);c.cancelled(msg.dst,msg.order.id);break;
         case SPREAD:
             if (msg.spread_closed()) a.closed=true;
-            if (a.awaiting) { if (!a.closed) act(msg.dst,msg.spread_bid(),msg.spread_ask());a.awaiting=false; } break;
+            if (a.awaiting) { if (!a.closed) act<Mode>(msg.dst,msg.spread_bid(),msg.spread_ask());a.awaiting=false; } break;
         case CLOSE_PRICE:break;
         default:throw std::runtime_error("unexpected agent message");
         }
@@ -310,7 +333,11 @@ public:
     }
     ~Simulation() {stop_latency();}
     void stop_latency() {action_stream.reset();latency_stream.reset();}
-    void run() {
+    int execution_latency=-1;
+    bool execution_plain_protocol=false;
+private:
+    template<class Mode> void run_mode() {
+        execution_latency=Mode::latency;execution_plain_protocol=Mode::plain_protocol;
         c.wake(0,c.close);for (size_t i=0;i<c.agents.size();++i) c.wake(i,c.now);
         while (!c.empty()&&c.now&&c.now<=c.stop) {
 #ifdef T3_REF_MESSAGES
@@ -324,16 +351,39 @@ public:
             if (msg.kind==WAKE) {
                 msg.recv=c.now;c.delivered(msg);
                 if (msg.dst==0) {
-                    if (c.now>=c.close) { Msg broadcast=c.make(CLOSE_PRICE);for (int sub:c.subscriptions) send(0,sub,broadcast); }
+                    if (c.now>=c.close) { Msg broadcast=c.make(CLOSE_PRICE);for (int sub:c.subscriptions) send<Mode>(0,sub,broadcast); }
                 } else {
-                    if (a.first) { a.first=false;simple(msg.dst,0,CLOSE_REQ); }
-                    if (!a.hours) simple(msg.dst,0,HOURS_REQ);
-                    if (a.hours&&!a.closed) { c.wake(msg.dst,c.now+a.interval);simple(msg.dst,0,QUERY);a.awaiting=true; }
+                    if (a.first) { a.first=false;simple<Mode>(msg.dst,0,CLOSE_REQ); }
+                    if (!a.hours) simple<Mode>(msg.dst,0,HOURS_REQ);
+                    if (a.hours&&!a.closed) { c.wake(msg.dst,c.now+a.interval);simple<Mode>(msg.dst,0,QUERY);a.awaiting=true; }
                 }
                 a.time+=a.delay;
-            } else { a.time+=a.delay;c.delivered(msg);if (msg.dst==0) exchange(msg);else receive(msg); }
+            } else { a.time+=a.delay;c.delivered(msg);if (msg.dst==0) exchange<Mode>(msg);else receive<Mode>(msg); }
             c.recipient_ready(msg.dst,a.time);
         }
+    }
+    template<bool PLAIN> void select_latency() {
+#ifdef T3_SPECIALIZE_LATENCY
+        if(action_latency) return run_mode<ExecutionMode<-1,PLAIN>>();
+        if(latency_kind==4) return run_mode<ExecutionMode<4,PLAIN>>();
+        if(latency_kind==0) return run_mode<ExecutionMode<0,PLAIN>>();
+        if(latency_stream) return run_mode<ExecutionMode<5,PLAIN>>();
+        if(latency_kind==1) return run_mode<ExecutionMode<1,PLAIN>>();
+        if(latency_kind==2) return run_mode<ExecutionMode<2,PLAIN>>();
+        if(latency_kind==3) return run_mode<ExecutionMode<3,PLAIN>>();
+#endif
+        run_mode<ExecutionMode<-1,PLAIN>>();
+    }
+public:
+    void run() {
+#if defined(T3_SPECIALIZE_LATENCY) || defined(T3_SPECIALIZE_PROTOCOL)
+        const char* mode=std::getenv("T3SIM_EXECUTION_MODE");
+        if(mode&&std::strcmp(mode,"generic")==0) return run_mode<ExecutionMode<>>();
+#endif
+#ifdef T3_SPECIALIZE_PROTOCOL
+        if(c.stp==0&&c.ack_delay==0) return select_latency<true>();
+#endif
+        select_latency<false>();
     }
 };
 }

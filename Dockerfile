@@ -70,9 +70,12 @@ CMD ["--help"]
 FROM cpp-toolchain AS lite-compiler
 RUN apt-get update && apt-get install -y --no-install-recommends libsnappy-dev=1.2.2-1
 COPY native /opt/native
-COPY scripts/build_lite.sh scripts/build_release.sh scripts/pgo_scenarios.py /tmp/
+COPY scripts/build_lite.sh scripts/build_release.sh scripts/pgo_scenarios.py scripts/pgo_specialized.py /tmp/
 ARG T3_BUILD_PGO=1
-RUN T3_BUILD_PGO=$T3_BUILD_PGO sh /tmp/build_release.sh
+ARG T3_EXTRA_CXX_FLAGS=""
+ARG T3_SPECIALIZED_PGO=0
+RUN if [ "$T3_SPECIALIZED_PGO" = 1 ]; then export T3_PGO_SCENARIOS=/tmp/pgo_specialized.py; fi; \
+    T3_BUILD_PGO=$T3_BUILD_PGO T3_EXTRA_CXX_FLAGS="$T3_EXTRA_CXX_FLAGS" sh /tmp/build_release.sh
 
 # Assemble one small runtime layer after compiling the static executable.
 FROM lite-compiler AS runtime-root

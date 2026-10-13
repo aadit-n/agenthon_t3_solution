@@ -1,5 +1,6 @@
 *
 !Dockerfile
+!Dockerfile.execution
 !requirements.txt
 !setup_native.py
 !LICENSE
@@ -14,6 +15,7 @@
 !scripts/build_release.sh
 !scripts/prepare_runtime.sh
 !scripts/pgo_scenarios.py
+!scripts/pgo_specialized.py
 !native/
 !native/**
 !t3sim/

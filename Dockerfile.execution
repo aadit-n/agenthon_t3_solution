@@ -1,0 +1,16 @@
+# Package a measured static executable using the validated v7 compatibility set.
+# candidate contains only binaries; source contains the matching native sources.
+FROM agenthon-t3:v7 AS execution-root
+ARG T3_EXECUTION_VARIANT=narrow-latency
+COPY --chmod=755 --from=candidate /${T3_EXECUTION_VARIANT} /opt/t3sim-cpp
+COPY --from=source / /opt/relink/native/
+COPY scripts/build_lite.sh scripts/build_release.sh scripts/pgo_scenarios.py scripts/pgo_specialized.py scripts/prepare_runtime.sh /opt/relink/scripts/
+COPY Dockerfile Dockerfile.execution /opt/relink/
+
+FROM scratch
+LABEL qfbench2.interface_version="2.0"
+ENV T3SIM_STREAM_LEDGER=1 T3SIM_STREAM_TRACE=auto T3SIM_LATENCY_PREFETCH=auto
+COPY --from=execution-root / /
+WORKDIR /work
+ENTRYPOINT ["/opt/t3sim-cpp"]
+CMD ["--help"]
